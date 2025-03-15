@@ -12,7 +12,6 @@ from ta.momentum import RSIIndicator, StochasticOscillator, awesome_oscillator
 from ta.volatility import AverageTrueRange
 import logging
 import ccxt
-import telegram
 import csv
 from datetime import datetime, timedelta
 import json
@@ -301,10 +300,10 @@ def calculate_trailing_stop(entry_price, current_price, latest_atr, signal):
     # Tính trailing_stop_price
     if signal == "LONG":
         trailing_stop_price = current_price * (1 - trailing_stop_factor)
-        return trailing_stop_price
     else:
         trailing_stop_price = current_price * (1 + trailing_stop_factor)
-        return trailing_stop_price
+    
+    return trailing_stop_price, trailing_stop_factor
 
 def adjust_trade_percentage(capital, initial_capital):
     if capital < initial_capital * 0.8:
@@ -527,7 +526,7 @@ def main():
             profit_percent, profit_usdt, adjusted_entry_price, adjusted_exit_price = calculate_pnl(entry_price, current_price, signal, amount, current_leverage, fee_rate, slippage_rate)
             logging.info(f"Current position: {signal}, Entry: {entry_price:.2f}, Adjusted Entry: {adjusted_entry_price:.2f}, Current: {current_price:.2f}, PnL: {profit_percent:.2f}% ({profit_usdt:.2f} USDT), Leverage: {current_leverage}x")
 
-            new_trailing_stop = calculate_trailing_stop(entry_price, current_price, latest_atr, signal)
+            new_trailing_stop, trailing_stop_factor = calculate_trailing_stop(entry_price, current_price, latest_atr, signal)
             trailing_stop_price = max(trailing_stop_price, new_trailing_stop) if signal == "LONG" else min(trailing_stop_price, new_trailing_stop)
             logging.info(f"Trailing Stop Factor: {trailing_stop_factor:.4f}, New Trailing Stop: {new_trailing_stop:.2f}, Current Trailing Stop: {trailing_stop_price:.2f}")
 
@@ -593,7 +592,7 @@ def main():
                     amount = amount_usd / (current_price * current_leverage)
                     adjusted_entry_price = current_price * (1 + slippage_rate if signal == "LONG" else 1 - slippage_rate)
                     latest_atr = df["atr"].iloc[-1]
-                    initial_trailing_stop = calculate_trailing_stop(adjusted_entry_price, current_price, latest_atr, signal)
+                    initial_trailing_stop, _ = calculate_trailing_stop(adjusted_entry_price, current_price, latest_atr, signal)
                     current_position = (signal, adjusted_entry_price, amount, current_leverage, initial_trailing_stop)
                     message = f"Enter {signal} at {adjusted_entry_price:.2f}, Leverage: {current_leverage}x, Amount: {amount:.4f} BTC, Confidence: {confidence:.2f}, Predicted Class: {predicted_class}, Capital: {capital:.2f} USD"
                     send_telegram_message(message)
