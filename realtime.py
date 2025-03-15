@@ -12,6 +12,7 @@ from ta.momentum import RSIIndicator, StochasticOscillator, awesome_oscillator
 from ta.volatility import AverageTrueRange
 import logging
 import ccxt
+import telegram
 import csv
 from datetime import datetime, timedelta
 import json
@@ -29,20 +30,20 @@ exchange = ccxt.binance({
 
 symbol = "BTC/USDT"
 interval = "5m"
-base_timesteps = 20  # Giảm từ 30 xuống 20 để phản ứng nhanh hơn
-lookback_minutes = 600  # 10 giờ
+base_timesteps = 20
+lookback_minutes = 600
 initial_capital = 1000
 capital = initial_capital
-trade_percentage = 0.10  # 10% tổng vốn
-fee_rate = 0.0002  # Phí giao dịch 0.02%
-slippage_rate = 0.0001  # Trượt giá 0.01%
-risk_per_trade = 0.02  # Rủi ro tối đa 2% mỗi giao dịch
+trade_percentage = 0.10
+fee_rate = 0.0002
+slippage_rate = 0.0001
+risk_per_trade = 0.02
 confidence_threshold = 0.25
 adx_threshold = 10
 rsi_overbought = 70
 rsi_oversold = 30
-stop_loss_target = 0.20  # Stop loss 20% trên số tiền vào lệnh
-take_profit_percent = 0.04  # R:R 1:2, sẽ tính động dựa trên stop_loss_percent
+stop_loss_target = 0.20
+take_profit_percent = 0.04  # Sẽ tính động
 base_confidence_threshold = 0.30
 
 trade_history = []
@@ -57,20 +58,14 @@ last_day = None
 is_trading_paused = False
 last_drawdown_check = time.time()
 hourly_stats = {f"{i:02d}h-{((i+6)%24):02d}h": {"trades": 0, "profit": 0} for i in range(0, 24, 6)}
-max_drawdown_limit = 20  # 20% drawdown
+max_drawdown_limit = 20
 min_capital_threshold = initial_capital * 0.5
-max_loss_threshold = initial_capital * 0.02  # 2% = 20 USDT
-
-# Thêm biến để lưu trữ tổn thất tổng cộng
+max_loss_threshold = initial_capital * 0.02
 total_loss = 0
-
-# Thêm biến để lưu trữ tín hiệu theo ngày
 short_signals_by_date = []
 long_signals_by_date = []
 all_signals_by_date = []
 signals_log = []
-
-# Biến để theo dõi nến cuối cùng
 last_candle_time = None
 
 # Định nghĩa lại focal loss
@@ -203,7 +198,7 @@ def add_features_incremental(df, prev_df=None):
         return pd.concat([prev_df, new_df]).drop_duplicates()
     return new_df
 
-def prepare_prediction_data(df, features, timesteps=20):  # Giảm timesteps từ 30 xuống 20
+def prepare_prediction_data(df, features, timesteps=20):
     if len(df) < timesteps:
         return None
     X = []
@@ -282,21 +277,28 @@ def generate_signal(df):
 
 def calculate_pnl(entry_price, current_price, signal, amount, leverage, fee_rate, slippage_rate):
     adjusted_entry_price = entry_price * (1 + slippage_rate if signal == "LONG" else 1 - slippage_rate)
-    adjusted_exit_price = current_price * (1 - slippage_rate if signal == "LONG" else 1 + slippage_rate)
     if signal == "LONG":
-        profit_percent = ((adjusted_exit_price - adjusted_entry_price) / adjusted_entry_price) * 100 * leverage
-    else:
-        profit_percent = ((adjusted_entry_price - adjusted_exit_price) / adjusted_entry_price) * 100 * leverage
-    entry_fee = adjusted_entry_price * amount * fee_rate
-    exit_fee = adjusted_exit_price * amount * fee_rate
-    slippage_in = adjusted_entry_price * amount * slippage_rate
-    slippage_out = adjusted_exit_price * amount * slippage_rate
-    total_fee = entry_fee + exit_fee + slippage_in + slippage_out
-    profit_usdt = (profit_percent / 100) * (adjusted_entry_price * amount) - total_fee
+        profit_percent = ((current_price - adjusted_entry_price) / adjusted_entry_price) * leverage * 100
+    else:  # SHORT
+        profit_percent = ((adjusted_entry_price - current_price) / adjusted_entry_price) * leverage * 100
+    trade_value = adjusted_entry_price * amount * leverage
+    profit_usdt = (profit_percent / 100) * trade_value
+    adjusted_exit_price = current_price
     return profit_percent, profit_usdt, adjusted_entry_price, adjusted_exit_price
 
 def calculate_trailing_stop(entry_price, current_price, latest_atr, signal):
-    trailing_stop_factor = 0.5 * latest_atr / entry_price
+    # Tính tỷ lệ biến động dựa trên ATR so với giá vào lệnh
+    atr_ratio = latest_atr / entry_price
+    
+    # Điều chỉnh trailing_stop_factor dựa trên biến động thị trường
+    if atr_ratio < 0.01:  # Biến động thấp (< 1%)
+        trailing_stop_factor = 0.2 * atr_ratio
+    elif atr_ratio <= 0.03:  # Biến động trung bình (1% - 3%)
+        trailing_stop_factor = 0.3 * atr_ratio
+    else:  # Biến động cao (> 3%)
+        trailing_stop_factor = 0.4 * atr_ratio
+    
+    # Tính trailing_stop_price
     if signal == "LONG":
         trailing_stop_price = current_price * (1 - trailing_stop_factor)
         return trailing_stop_price
@@ -523,17 +525,17 @@ def main():
             signal, entry_price, amount, current_leverage, trailing_stop_price = current_position
             latest_atr = df["atr"].iloc[-1]
             profit_percent, profit_usdt, adjusted_entry_price, adjusted_exit_price = calculate_pnl(entry_price, current_price, signal, amount, current_leverage, fee_rate, slippage_rate)
-            logging.info(f"Current position: {signal}, Entry: {entry_price:.2f}, Current: {current_price:.2f}, PnL: {profit_percent:.2f}% ({profit_usdt:.2f} USDT), Leverage: {current_leverage}x")
+            logging.info(f"Current position: {signal}, Entry: {entry_price:.2f}, Adjusted Entry: {adjusted_entry_price:.2f}, Current: {current_price:.2f}, PnL: {profit_percent:.2f}% ({profit_usdt:.2f} USDT), Leverage: {current_leverage}x")
 
             new_trailing_stop = calculate_trailing_stop(entry_price, current_price, latest_atr, signal)
             trailing_stop_price = max(trailing_stop_price, new_trailing_stop) if signal == "LONG" else min(trailing_stop_price, new_trailing_stop)
+            logging.info(f"Trailing Stop Factor: {trailing_stop_factor:.4f}, New Trailing Stop: {new_trailing_stop:.2f}, Current Trailing Stop: {trailing_stop_price:.2f}")
 
-            # Tính stop_loss_percent động dựa trên leverage
-            stop_loss_percent = stop_loss_target / current_leverage  # Ví dụ: 0.20 / 10 = 0.02 (2%)
-            take_profit_percent = stop_loss_percent * 2  # R:R 1:2
+            stop_loss_percent = stop_loss_target / current_leverage
+            take_profit_percent = stop_loss_percent * 2
 
-            tp_price = adjusted_entry_price * (1 + take_profit_percent) if signal == "LONG" else adjusted_entry_price * (1 - take_profit_percent)
             sl_price = adjusted_entry_price * (1 - stop_loss_percent) if signal == "LONG" else adjusted_entry_price * (1 + stop_loss_percent)
+            tp_price = adjusted_entry_price * (1 + take_profit_percent) if signal == "LONG" else adjusted_entry_price * (1 - take_profit_percent)
 
             if ((signal == "LONG" and (current_price >= tp_price or current_price <= sl_price or current_price <= trailing_stop_price)) or
                 (signal == "SHORT" and (current_price <= tp_price or current_price >= sl_price or current_price >= trailing_stop_price))):
@@ -561,7 +563,6 @@ def main():
                 send_telegram_message(f"Warning: Loss streak reached {loss_streak} trades!")
 
         if current_position is None:
-            # Kiểm tra nếu có nến 5 phút mới
             current_candle_time = df.index[-1]
             if last_candle_time != current_candle_time:
                 last_candle_time = current_candle_time
@@ -575,21 +576,26 @@ def main():
                         reason = "ADX too low"
                     elif confidence <= base_confidence_threshold:
                         reason = "Confidence too low"
-                signals_log.append((timestamp, signal, confidence, current_price, reason, 0))
+                signals_log.append((timestamp, signal, confidence, current_price, reason, predicted_class))
                 if signal != "NO_SIGNAL":
-                    current_leverage = determine_leverage(confidence)
+                    if predicted_class == 1:
+                        current_leverage = min(determine_leverage(confidence) * 1.5, 25)
+                    elif predicted_class == -1:
+                        current_leverage = max(determine_leverage(confidence) * 0.5, 5)
+                    else:
+                        current_leverage = determine_leverage(confidence)
                     amount_usd = capital * adjusted_trade_percentage
                     if amount_usd > capital:
                         amount_usd = capital
                     if amount_usd <= 0:
-                        signals_log[-1] = (timestamp, "NO_SIGNAL", confidence, current_price, "Insufficient capital", 0)
+                        signals_log[-1] = (timestamp, "NO_SIGNAL", confidence, current_price, "Insufficient capital", predicted_class)
                         continue
                     amount = amount_usd / (current_price * current_leverage)
                     adjusted_entry_price = current_price * (1 + slippage_rate if signal == "LONG" else 1 - slippage_rate)
                     latest_atr = df["atr"].iloc[-1]
                     initial_trailing_stop = calculate_trailing_stop(adjusted_entry_price, current_price, latest_atr, signal)
                     current_position = (signal, adjusted_entry_price, amount, current_leverage, initial_trailing_stop)
-                    message = f"Enter {signal} at {adjusted_entry_price:.2f}, Leverage: {current_leverage}x, Amount: {amount:.4f} BTC, Confidence: {confidence:.2f}, Capital: {capital:.2f} USD"
+                    message = f"Enter {signal} at {adjusted_entry_price:.2f}, Leverage: {current_leverage}x, Amount: {amount:.4f} BTC, Confidence: {confidence:.2f}, Predicted Class: {predicted_class}, Capital: {capital:.2f} USD"
                     send_telegram_message(message)
                     logging.info(message)
                     if signal == "SHORT":
@@ -598,7 +604,7 @@ def main():
                         long_signals_by_date.append(date)
                     all_signals_by_date.append(date)
                 else:
-                    logging.info(f"No signal generated, Price: {current_price:.4f}, Confidence: {confidence:.2f}")
+                    logging.info(f"No signal generated, Price: {current_price:.4f}, Confidence: {confidence:.2f}, Predicted Class: {predicted_class}")
                     logging.debug(f"Time: {df.index[-1]}, Signal: {signal}, Confidence: {confidence:.2f}, Price: {current_price:.2f}")
 
         historical_df = df
