@@ -36,8 +36,8 @@ confidence_threshold = 0.15
 adx_threshold = 5
 rsi_overbought = 80
 rsi_oversold = 20
-tp_ratio = 0.4  # Lãi 40% (sẽ chia cho leverage)
-sl_ratio = 0.2  # Lỗ 20% (sẽ chia cho leverage)
+tp_ratio = 0.25  # Lãi 25% (sẽ chia cho leverage)
+sl_ratio = 0.125  # Lỗ 12,5% (sẽ chia cho leverage)
 base_confidence_threshold = 0.20
 
 trade_history = []
