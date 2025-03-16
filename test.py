@@ -47,6 +47,7 @@ max_loss_threshold = 0.1  # 5% vốn mỗi lần kiểm tra
 trade_history = []
 capital_history = []
 market_data_history = []
+telegram_log = []  # List để lưu log Telegram trước khi ghi vào CSV
 current_position = None
 total_trades = 0
 winning_trades = 0
@@ -84,7 +85,7 @@ scaler = pd.read_pickle("scaler.pkl")
 model = load_model("optimized_model.keras", custom_objects={"focal_loss_fixed": focal_loss(gamma=1.0, alpha=0.5)})
 data_scaled_buffer = None
 
-# Hàm lấy dữ liệu lịch sử (giữ nguyên)
+# Hàm lấy dữ liệu lịch sử
 def get_historical_data(symbol, interval, lookback_hours=24, max_retries=5):
     url = "https://api.binance.com/api/v3/klines"
     data = []
@@ -134,7 +135,7 @@ def get_historical_data(symbol, interval, lookback_hours=24, max_retries=5):
     logging.info(f"Fetched {len(df)} historical data points")
     return df
 
-# Hàm lấy giá hiện tại (giữ nguyên)
+# Hàm lấy giá hiện tại
 def get_current_price(symbol, signal=None, max_retries=5):
     retries = 0
     while retries < max_retries:
@@ -159,7 +160,7 @@ def get_current_price(symbol, signal=None, max_retries=5):
     logging.error("Max retries reached. Failed to fetch current price.")
     return None
 
-# Hàm lấy dữ liệu realtime (giữ nguyên)
+# Hàm lấy dữ liệu realtime
 def get_realtime_data(symbol, interval, historical_df, max_retries=10):
     retries = 0
     while retries < max_retries:
@@ -197,8 +198,7 @@ def check_rate_limit():
         time.sleep(wait_time)
     exchange.last_call = current_time
 
-# Thêm tính năng và chỉ báo (giữ nguyên)
-# Thêm tính năng và chỉ báo (đã sửa)
+# Thêm tính năng và chỉ báo
 def add_features_incremental(df, prev_df=None):
     global data_scaled_buffer
     if prev_df is not None and len(df) > len(prev_df):
@@ -249,7 +249,7 @@ def prepare_prediction_data(df, features, timesteps=20):
         return None
     return data_scaled_buffer.reshape(1, timesteps, len(features))
 
-# Điều chỉnh đòn bẩy dựa trên ATR và ADX (giữ nguyên)
+# Điều chỉnh đòn bẩy dựa trên ATR và ADX
 def determine_leverage(confidence, latest_atr, entry_price, latest_adx):
     atr_ratio = latest_atr / entry_price
     adx_factor = latest_adx / 20
@@ -264,7 +264,7 @@ def determine_leverage(confidence, latest_atr, entry_price, latest_adx):
         leverage = min(leverage, max_leverage)
     return leverage
 
-# Tính toán TP/SL dựa trên đòn bẩy và ATR (giữ nguyên)
+# Tính toán TP/SL dựa trên đòn bẩy và ATR
 def calculate_sl_tp(entry_price, signal, leverage, sl_ratio, tp_ratio, latest_atr, slippage_rate=0.0001):
     adjusted_entry_price = entry_price * (1 + slippage_rate if signal == "LONG" else 1 - slippage_rate)
     atr_ratio = latest_atr / entry_price
@@ -285,14 +285,13 @@ def calculate_sl_tp(entry_price, signal, leverage, sl_ratio, tp_ratio, latest_at
     logging.info(f"Calculated SL: {sl_price:.2f}, TP: {tp_price:.2f} for signal: {signal}, Entry: {entry_price:.2f}, Leverage: {leverage}x, TP Change: {tp_price_change*100:.2f}%, SL Change: {sl_price_change*100:.2f}%")
     return sl_price, tp_price
 
-# Tính toán Trailing Stop (đã sửa đổi)
+# Tính toán Trailing Stop
 def calculate_trailing_stop(entry_price, current_price, latest_atr, signal, sl_price, profit_percent, tp_price):
     atr_ratio = latest_atr / entry_price
-    # Điều chỉnh trailing stop factor dựa trên lợi nhuận
     if profit_percent >= 0.5 * (tp_price / entry_price - 1 if signal == "LONG" else 1 - tp_price / entry_price) * 100:
-        trailing_stop_factor = max(0.001, atr_ratio * 0.5)  # Siết chặt khi đạt 50% TP
+        trailing_stop_factor = max(0.001, atr_ratio * 0.5)
     else:
-        trailing_stop_factor = max(0.005, atr_ratio)  # Nới lỏng nếu chưa có lợi nhuận
+        trailing_stop_factor = max(0.005, atr_ratio)
 
     if signal == "LONG":
         initial_trailing_stop = entry_price * (1 - trailing_stop_factor)
@@ -306,9 +305,9 @@ def calculate_trailing_stop(entry_price, current_price, latest_atr, signal, sl_p
     logging.info(f"Trailing Stop calculated: {trailing_stop_price:.2f}, Factor: {trailing_stop_factor:.4f}, Current Price: {current_price:.2f}")
     return trailing_stop_price, trailing_stop_factor
 
-# Hàm điều chỉnh SL về breakeven (mới)
+# Hàm điều chỉnh SL về breakeven
 def adjust_sl_to_breakeven(entry_price, current_price, signal, leverage, sl_price, profit_percent):
-    min_profit_threshold = 1.0  # 1% sau leverage
+    min_profit_threshold = 1.0
     adjusted_profit_percent = profit_percent * leverage
 
     if adjusted_profit_percent >= min_profit_threshold:
@@ -321,7 +320,7 @@ def adjust_sl_to_breakeven(entry_price, current_price, signal, leverage, sl_pric
         logging.info(f"SL adjusted to breakeven: {sl_price:.2f}")
     return sl_price
 
-# Tính toán PnL (giữ nguyên)
+# Tính toán PnL
 def calculate_pnl(entry_price, current_price, signal, leverage, fee_rate, slippage_rate, amount_usd=100):
     adjusted_entry_price = entry_price * (1 + slippage_rate if signal == "LONG" else 1 - slippage_rate)
     notional_value = amount_usd * leverage
@@ -338,8 +337,7 @@ def calculate_pnl(entry_price, current_price, signal, leverage, fee_rate, slippa
     logging.debug(f"Debug PnL: entry={adjusted_entry_price:.2f}, exit={current_price:.2f}, diff={price_diff*100:.4f}%, leverage={leverage}, value={position_value:.2f}, fee={fee:.2f}, profit={profit_usdt:.2f}")
     return profit_percent, profit_usdt, adjusted_entry_price, adjusted_exit_price, position_value
 
-# Tạo tín hiệu vào lệnh (giữ nguyên)
-# Tạo tín hiệu vào lệnh (đã sửa)
+# Tạo tín hiệu vào lệnh
 def generate_signal(df):
     features = ["price_change", "rsi", "atr", "adx", "adx_pos", "adx_neg", "stoch", "momentum", "awesome", "hour", "dayofweek"]
     X = prepare_prediction_data(df, features)
@@ -356,7 +354,6 @@ def generate_signal(df):
     avg_price_change = df["price_change"].iloc[-base_timesteps:].mean()
     short_momentum = df["momentum"].iloc[-5:].mean()
     
-    # Điều chỉnh confidence threshold dựa trên ATR
     adjusted_threshold = base_confidence_threshold * (1 - atr_ratio)
     adjusted_threshold = max(0.1, min(adjusted_threshold, 0.25))
     
@@ -390,41 +387,80 @@ def generate_signal(df):
     logging.info(f"No signal: Failed final conditions")
     return "NO_SIGNAL", confidence, predicted_class
 
-# Hàm xử lý partial profit (đã sửa đổi)
-def handle_partial_profit(current_position, entry_price, current_price, signal, leverage, fee_rate, slippage_rate, amount_usd, capital, total_loss, daily_loss, tp_price, trade_history):
+# Hàm xử lý partial profit (Cải tiến: Chia thành 3 giai đoạn)
+def handle_partial_profit(current_position, entry_price, current_price, signal, leverage, fee_rate, slippage_rate, amount_usd, capital, total_loss, daily_loss, tp_price, trade_history, hedge_position):
     profit_percent = (current_price / entry_price - 1) * 100 if signal == "LONG" else (1 - current_price / entry_price) * 100
     profit_percent *= leverage
+    half_tp = tp_price * 0.5 if signal == "LONG" else tp_price * 1.5
     three_quarter_tp = tp_price * 0.75 if signal == "LONG" else tp_price * 1.25
 
     partial_profit_taken = False
     if signal == "LONG":
-        if current_price >= three_quarter_tp and amount_usd > 0:
-            partial_amount_usd = amount_usd * 0.3 / 0.5
-            _, partial_profit, _, _, _ = calculate_pnl(entry_price, current_price, signal, leverage, fee_rate, slippage_rate, partial_amount_usd)
-            if partial_profit > 1.0:  # Yêu cầu lợi nhuận tối thiểu 1 USD
-                capital += partial_profit
-                total_loss += partial_profit
-                daily_loss += partial_profit
-                amount_usd *= 0.2 / 0.5
-                trade_history.append((datetime.now(), entry_price, f"{signal}_PARTIAL_75%", current_price, partial_profit, capital, leverage))
-                send_telegram_message(f"Partial profit taken (75%) for {signal} at {current_price:.2f}, PnL: {partial_profit:.2f} USD, Capital: {capital:.2f} USD")
-                partial_profit_taken = True
-    else:  # SHORT
-        if current_price <= three_quarter_tp and amount_usd > 0:
-            partial_amount_usd = amount_usd * 0.3 / 0.5
+        if current_price >= half_tp and amount_usd > 0:
+            partial_amount_usd = amount_usd * 0.5
             _, partial_profit, _, _, _ = calculate_pnl(entry_price, current_price, signal, leverage, fee_rate, slippage_rate, partial_amount_usd)
             if partial_profit > 1.0:
                 capital += partial_profit
                 total_loss += partial_profit
                 daily_loss += partial_profit
-                amount_usd *= 0.2 / 0.5
+                amount_usd *= 0.5
+                trade_history.append((datetime.now(), entry_price, f"{signal}_PARTIAL_50%", current_price, partial_profit, capital, leverage))
+                send_telegram_message(f"Partial profit taken (50%) for {signal} at {current_price:.2f}, PnL: {partial_profit:.2f} USD, Capital: {capital:.2f} USD")
+                partial_profit_taken = True
+        elif current_price >= three_quarter_tp and amount_usd > 0:
+            partial_amount_usd = amount_usd * 0.25
+            _, partial_profit, _, _, _ = calculate_pnl(entry_price, current_price, signal, leverage, fee_rate, slippage_rate, partial_amount_usd)
+            if partial_profit > 1.0:
+                capital += partial_profit
+                total_loss += partial_profit
+                daily_loss += partial_profit
+                amount_usd *= 0.75
+                trade_history.append((datetime.now(), entry_price, f"{signal}_PARTIAL_75%", current_price, partial_profit, capital, leverage))
+                send_telegram_message(f"Partial profit taken (75%) for {signal} at {current_price:.2f}, PnL: {partial_profit:.2f} USD, Capital: {capital:.2f} USD")
+                partial_profit_taken = True
+    else:  # SHORT
+        if current_price <= half_tp and amount_usd > 0:
+            partial_amount_usd = amount_usd * 0.5
+            _, partial_profit, _, _, _ = calculate_pnl(entry_price, current_price, signal, leverage, fee_rate, slippage_rate, partial_amount_usd)
+            if partial_profit > 1.0:
+                capital += partial_profit
+                total_loss += partial_profit
+                daily_loss += partial_profit
+                amount_usd *= 0.5
+                trade_history.append((datetime.now(), entry_price, f"{signal}_PARTIAL_50%", current_price, partial_profit, capital, leverage))
+                send_telegram_message(f"Partial profit taken (50%) for {signal} at {current_price:.2f}, PnL: {partial_profit:.2f} USD, Capital: {capital:.2f} USD")
+                partial_profit_taken = True
+        elif current_price <= three_quarter_tp and amount_usd > 0:
+            partial_amount_usd = amount_usd * 0.25
+            _, partial_profit, _, _, _ = calculate_pnl(entry_price, current_price, signal, leverage, fee_rate, slippage_rate, partial_amount_usd)
+            if partial_profit > 1.0:
+                capital += partial_profit
+                total_loss += partial_profit
+                daily_loss += partial_profit
+                amount_usd *= 0.75
                 trade_history.append((datetime.now(), entry_price, f"{signal}_PARTIAL_75%", current_price, partial_profit, capital, leverage))
                 send_telegram_message(f"Partial profit taken (75%) for {signal} at {current_price:.2f}, PnL: {partial_profit:.2f} USD, Capital: {capital:.2f} USD")
                 partial_profit_taken = True
 
-    return partial_profit_taken, amount_usd, capital, total_loss, daily_loss
+    # Đóng một phần Hedge khi chốt lãi một phần từ lệnh chính
+    if partial_profit_taken and hedge_position is not None:
+        hedge_signal, hedge_entry_price, hedge_amount, hedge_leverage, _, hedge_sl_price, hedge_tp_price, _, hedge_amount_usd = hedge_position
+        partial_hedge_amount_usd = hedge_amount_usd * 0.5  # Đóng 50% Hedge khi chốt 50% vị thế chính
+        _, hedge_profit_usdt, _, hedge_exit_price, _ = calculate_pnl(hedge_entry_price, current_price, hedge_signal, hedge_leverage, fee_rate, slippage_rate, partial_hedge_amount_usd)
+        capital += hedge_profit_usdt
+        total_loss += hedge_profit_usdt
+        daily_loss += hedge_profit_usdt
+        hedge_amount_usd *= 0.5
+        trade_history.append((datetime.now(), hedge_entry_price, f"{hedge_signal}_PARTIAL", hedge_exit_price, hedge_profit_usdt, capital, hedge_leverage))
+        send_telegram_message(f"Partial Hedge closed: {hedge_signal}, Entry: {hedge_entry_price:.2f}, Exit: {hedge_exit_price:.2f}, PnL: {hedge_profit_usdt:.2f} USD")
+        if hedge_amount_usd <= 0:
+            hedge_position = None
+        else:
+            hedge_position = (hedge_signal, hedge_entry_price, hedge_amount * 0.5, hedge_leverage, None, hedge_sl_price, hedge_tp_price, datetime.now(), hedge_amount_usd)
 
-# Vẽ biểu đồ phân phối giao dịch (giữ nguyên)
+    return partial_profit_taken, amount_usd, capital, total_loss, daily_loss, hedge_position
+
+# Vẽ biểu đồ phân phối giao dịch
 def plot_trade_distribution():
     short_counts = Counter(short_signals_by_date)
     long_counts = Counter(long_signals_by_date)
@@ -452,21 +488,35 @@ def plot_trade_distribution():
     plt.close()
     logging.info("Trade distribution chart saved as 'trade_distribution_realtime.png'")
 
+# Hàm lưu log Telegram vào CSV
+def save_telegram_log():
+    with open('telegram_log.csv', 'a', newline='') as f:
+        writer = csv.writer(f)
+        if f.tell() == 0:  # Nếu file rỗng, ghi header
+            writer.writerow(["Timestamp", "Message", "Status"])
+        for log in telegram_log:
+            writer.writerow([log[0].strftime('%Y-%m-%d %H:%M:%S'), log[1], log[2]])
+    telegram_log.clear()  # Xóa danh sách log sau khi ghi vào file
+
 TELEGRAM_BOT_TOKEN = "7617216154:AAF-5RxHYmn63pC2BgGJTAMRm2ehO4HcZvA"
 TELEGRAM_CHAT_ID = "2028475238"
 
 def send_telegram_message(message):
+    global telegram_log
+    timestamp = datetime.now()
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
         payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "Markdown"}
         response = requests.post(url, data=payload)
         if response.status_code == 200:
             logging.info(f"Đã gửi thông báo Telegram: {message}")
+            telegram_log.append((timestamp, message, "Success"))
         else:
             logging.error(f"Lỗi gửi Telegram: {response.text}")
+            telegram_log.append((timestamp, message, f"Failed: {response.text}"))
     except Exception as e:
         logging.error(f"Lỗi khi gửi Telegram: {e}")
-        logging.info(f"Telegram message sent: {message}")
+        telegram_log.append((timestamp, message, f"Failed: {str(e)}"))
 
 def save_trade_history():
     with open('trade_history.csv', 'a', newline='') as f:
@@ -567,7 +617,6 @@ def check_api_status(exchange, symbol):
         logging.error(f"API connection failed: {e}")
         return False
 
-# Hàm chính (đã sửa đổi logic đóng vị thế)
 def main():
     global current_position, total_trades, winning_trades, capital, daily_trades, daily_profit, is_trading_paused, last_drawdown_check, total_loss, daily_loss, last_candle_time, data_scaled_buffer, last_loss_reset_time, last_reentry_time, hedge_position
     logging.info(f"Starting realtime trading system with initial capital: {initial_capital} USD")
@@ -687,7 +736,6 @@ def main():
             logging.warning("Using fallback price from last candle due to fetch failure.")
             current_price = df["close"].iloc[-1]
 
-        # Kiểm tra khung giờ giao dịch
         current_hour = datetime.now().hour
         hour_slot = f"{(current_hour // 6 * 6):02d}h-{((current_hour // 6 * 6 + 6) % 24):02d}h"
         if hourly_stats[hour_slot]["trades"] > 5 and hourly_stats[hour_slot]["profit"] < 0:
@@ -703,48 +751,42 @@ def main():
             profit_percent, profit_usdt, adjusted_entry_price, adjusted_exit_price, position_value = calculate_pnl(entry_price, current_price, signal, current_leverage, fee_rate, slippage_rate, amount_usd)
             logging.info(f"Current position: {signal}, Entry: {entry_price:.2f}, Current: {current_price:.2f}, PnL: {profit_percent:.2f}% ({profit_usdt:.2f} USD), Leverage: {current_leverage}x, Total Loss: {total_loss:.2f} USD, Position Value: {position_value:.2f} USD")
 
-            # Tính toán trailing stop động
             new_trailing_stop, trailing_stop_factor = calculate_trailing_stop(entry_price, current_price, latest_atr, signal, sl_price, profit_percent, tp_price)
             trailing_stop_price = new_trailing_stop
             logging.info(f"Trailing Stop Factor: {trailing_stop_factor:.4f}, Current Trailing Stop: {trailing_stop_price:.2f}")
 
-            # Điều chỉnh SL về breakeven nếu đạt lợi nhuận tối thiểu
             sl_price = adjust_sl_to_breakeven(entry_price, current_price, signal, current_leverage, sl_price, profit_percent)
 
-            # Kiểm tra partial profit
-            partial_profit_taken, amount_usd, capital, total_loss, daily_loss = handle_partial_profit(
-                current_position, entry_price, current_price, signal, current_leverage, fee_rate, slippage_rate, amount_usd, capital, total_loss, daily_loss, tp_price, trade_history
+            partial_profit_taken, amount_usd, capital, total_loss, daily_loss, hedge_position = handle_partial_profit(
+                current_position, entry_price, current_price, signal, current_leverage, fee_rate, slippage_rate, amount_usd, capital, total_loss, daily_loss, tp_price, trade_history, hedge_position
             )
 
-            # Tín hiệu ngược để thoát lệnh
             new_signal, new_confidence, new_predicted_class = generate_signal(df)
             signal_opposite = False
             if new_predicted_class != 0 and new_confidence > 0.7 and latest_adx > 25:
                 if (signal == "LONG" and new_predicted_class == -1) or (signal == "SHORT" and new_predicted_class == 1):
                     signal_opposite = True
 
-            # RSI đảo chiều mạnh (chỉ áp dụng sau 5 phút và ADX < 25)
             time_held = (datetime.now() - entry_time).total_seconds()
             rsi_exit = False
-            if time_held >= 300:  # 5 phút
+            if time_held >= 300:
                 if signal == "LONG" and latest_rsi < 30 and latest_adx < 25:
                     rsi_exit = True
                 elif signal == "SHORT" and latest_rsi > 70 and latest_adx < 25:
                     rsi_exit = True
 
-            # Time-based exit (thoát sau 15 phút nếu lợi nhuận < 2%)
+            # Cải tiến Time Exit: Kết hợp ADX và RSI
             time_exit = False
             if time_held >= 900 and profit_percent < 2.0:
-                time_exit = True
+                if latest_adx < 25 or (signal == "SHORT" and latest_rsi > 70):
+                    time_exit = True
 
-            # Trailing Stop exit
             trailing_stop_exit = False
             if signal == "LONG" and current_price <= trailing_stop_price:
                 trailing_stop_exit = True
             elif signal == "SHORT" and current_price >= trailing_stop_price:
                 trailing_stop_exit = True
 
-            # Điều kiện thoát lệnh
             should_exit = False
             exit_reason = ""
             if signal == "LONG":
@@ -786,15 +828,6 @@ def main():
                     should_exit = True
                     exit_reason = "Time Exit"
 
-            # Hedging nếu lỗ vượt 50% SL
-            if profit_usdt < 0 and abs(profit_usdt) > 0.5 * (sl_price / entry_price - 1 if signal == "LONG" else 1 - sl_price / entry_price) * position_value and hedge_position is None:
-                hedge_signal = "SHORT" if signal == "LONG" else "LONG"
-                hedge_amount_usd = amount_usd * 0.5
-                hedge_leverage = current_leverage
-                hedge_sl_price, hedge_tp_price = calculate_sl_tp(current_price, hedge_signal, hedge_leverage, sl_ratio, tp_ratio, latest_atr)
-                hedge_position = (hedge_signal, current_price, hedge_amount_usd / current_price, hedge_leverage, None, hedge_sl_price, hedge_tp_price, datetime.now(), hedge_amount_usd)
-                send_telegram_message(f"Hedging position opened: {hedge_signal}, Entry: {current_price:.2f}, Amount: {hedge_amount_usd:.2f} USD")
-
             if hedge_position is not None:
                 hedge_signal, hedge_entry_price, hedge_amount, hedge_leverage, _, hedge_sl_price, hedge_tp_price, _, hedge_amount_usd = hedge_position
                 _, hedge_profit_usdt, _, hedge_exit_price, _ = calculate_pnl(hedge_entry_price, current_price, hedge_signal, hedge_leverage, fee_rate, slippage_rate, hedge_amount_usd)
@@ -806,7 +839,6 @@ def main():
                     send_telegram_message(f"Hedge position closed at TP: {hedge_signal}, Entry: {hedge_entry_price:.2f}, Exit: {hedge_exit_price:.2f}, PnL: {hedge_profit_usdt:.2f} USD")
                     hedge_position = None
 
-            # Xử lý thoát lệnh hoặc cập nhật vị thế
             if should_exit or partial_profit_taken:
                 if should_exit:
                     total_trades += 1
@@ -828,6 +860,18 @@ def main():
                     logging.info(f"Exit {signal}: {exit_reason} - PnL: {profit_percent:.2f}% ({profit_usdt:.2f} USD), Capital: {capital:.2f} USD")
                     save_trade_history()
                     save_capital_history()
+
+                    # Đóng lệnh Hedge khi lệnh chính thoát
+                    if hedge_position is not None:
+                        hedge_signal, hedge_entry_price, hedge_amount, hedge_leverage, _, hedge_sl_price, hedge_tp_price, _, hedge_amount_usd = hedge_position
+                        _, hedge_profit_usdt, _, hedge_exit_price, _ = calculate_pnl(hedge_entry_price, current_price, hedge_signal, hedge_leverage, fee_rate, slippage_rate, hedge_amount_usd)
+                        capital += hedge_profit_usdt
+                        total_loss += hedge_profit_usdt
+                        daily_loss += hedge_profit_usdt
+                        trade_history.append((datetime.now(), hedge_entry_price, hedge_signal, hedge_exit_price, hedge_profit_usdt, capital, hedge_leverage))
+                        send_telegram_message(f"Hedge position closed on SHORT exit: {hedge_signal}, Entry: {hedge_entry_price:.2f}, Exit: {hedge_exit_price:.2f}, PnL: {hedge_profit_usdt:.2f} USD")
+                        hedge_position = None
+
                     current_position = None
                     last_reentry_time = datetime.now()
                 else:
@@ -852,7 +896,6 @@ def main():
                         reason = "Confidence too low"
                 signals_log.append((timestamp, signal, confidence, current_price, reason, predicted_class))
 
-                # Re-entry logic
                 if last_reentry_time and (datetime.now() - last_reentry_time).total_seconds() >= 900:
                     reentry_signal, reentry_confidence, reentry_class = generate_signal(df)
                     if reentry_signal != "NO_SIGNAL" and reentry_confidence > 0.8 and reentry_class == predicted_class:
@@ -886,6 +929,17 @@ def main():
                                f"Leverage: {current_leverage}x, Amount: {amount:.4f} BTC, Confidence: {confidence:.2f}, "
                                f"Predicted Class: {predicted_class}, Capital: {capital:.2f} USD, Total Loss: {total_loss:.2f} USD, "
                                f"SL: {sl_price:.2f}, TP: {tp_price:.2f}")
+
+                    # Mở lệnh Hedge mới với tp_ratio = 0.3, SL dựa trên ATR, và Amount tăng lên 75%
+                    if signal == "SHORT" and hedge_position is None:
+                        hedge_signal = "LONG"
+                        hedge_amount_usd = amount_usd * 0.75  # Tăng từ 0.5 lên 0.75
+                        hedge_leverage = current_leverage
+                        hedge_sl_price, hedge_tp_price = calculate_sl_tp(current_price, hedge_signal, hedge_leverage, sl_ratio, 0.3, latest_atr)
+                        hedge_sl_price = current_price * (1 - 2 * latest_atr / current_price)  # SL = giá vào - 2 * ATR
+                        hedge_position = (hedge_signal, current_price, hedge_amount_usd / current_price, hedge_leverage, None, hedge_sl_price, hedge_tp_price, datetime.now(), hedge_amount_usd)
+                        message += f"\nHedging position opened: {hedge_signal}, Entry: {current_price:.2f}, Amount: {hedge_amount_usd:.2f} USD, SL: {hedge_sl_price:.2f}, TP: {hedge_tp_price:.2f}"
+
                     send_telegram_message(message)
                     logging.info(message)
                     if signal == "SHORT":
@@ -902,6 +956,7 @@ def main():
             save_trade_history()
             save_capital_history()
             save_market_data()
+            save_telegram_log()  # Lưu log Telegram vào CSV mỗi ngày
             send_status_update()
             plot_trade_distribution()
 
