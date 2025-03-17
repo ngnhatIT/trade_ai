@@ -39,8 +39,8 @@ max_leverage = 20
 adx_threshold = 5
 rsi_overbought = 70
 rsi_oversold = 30
-max_loss_pause_threshold = 100
-max_drawdown_limit = 20
+max_loss_pause_threshold = 800
+max_drawdown_limit = 30
 min_capital_threshold = initial_capital * 0.5
 
 trade_history = []
