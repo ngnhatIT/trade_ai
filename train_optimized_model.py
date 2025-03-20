@@ -102,6 +102,9 @@ def calc_bb_lower(df):
 def calc_vwap(df):
     return volume_weighted_average_price(high=df["high"], low=df["low"], close=df["close"], volume=df["volume"], window=14).shift(1).fillna(0)
 
+def calc_ema_10(df):
+    return EMAIndicator(close=df["close"], window=10).ema_indicator().shift(1).fillna(0)
+
 def calc_ema_20(df):
     return EMAIndicator(close=df["close"], window=20).ema_indicator().shift(1).fillna(0)
 
@@ -121,7 +124,7 @@ def calc_mfi(df):
     return MFIIndicator(high=df["high"], low=df["low"], close=df["close"], volume=df["volume"], window=14).money_flow_index().shift(1).fillna(50)
 
 def calc_atr(df):
-    return AverageTrueRange(high=df["high"], low=df["low"], close=df["close"], window=14).average_true_range().shift(1).fillna(0)
+    return AverageTrueRange(high=df["high"], low=df["low"], close=df["close"], window=5).average_true_range().shift(1).fillna(0)
 
 def add_features(df):
     logging.info("Bắt đầu thêm đặc trưng...")
@@ -139,6 +142,7 @@ def add_features(df):
     df["bb_upper"] = calc_bb_upper(df)
     df["bb_lower"] = calc_bb_lower(df)
     df["vwap"] = calc_vwap(df)
+    df["ema_10"] = calc_ema_10(df)
     df["ema_20"] = calc_ema_20(df)
     df["ema_50"] = calc_ema_50(df)
     df["ema_200"] = calc_ema_200(df)
@@ -163,49 +167,122 @@ def add_features(df):
     logging.info("Hoàn thành thêm đặc trưng.")
     return df
 
-# 3. Định nghĩa nhãn (Điều chỉnh logic gán nhãn để cân bằng phân phối)
-def define_target(df, horizon=3, atr_multiplier=2.0):
-    logging.info("Bắt đầu định nghĩa nhãn...")
-    df["ema_50"] = EMAIndicator(close=df["close"], window=50).ema_indicator()
-    df["atr"] = calc_atr(df)
-    df["rsi"] = calc_rsi(df)
+# 3. Định nghĩa nhãn (Đã sửa để giữ ema_10 và atr)
+def define_target_new(df, horizon=5, atr_multiplier=0.1):
+    logging.info(f"Bắt đầu định nghĩa nhãn (horizon={horizon} giờ, atr_multiplier={atr_multiplier})...")
+    df = df.copy()
     
-    # Sử dụng ATR để điều chỉnh ngưỡng theo volatility
+    df["ema_10"] = calc_ema_10(df)
+    df["atr"] = calc_atr(df)
+    
+    df["future_return"] = df["close"].shift(-horizon) / df["close"] - 1
+    long_threshold = 0.001  # +0.1%
+    short_threshold = -0.001  # -0.1%
+    
     df["threshold"] = df["atr"] * atr_multiplier
-    df["breakout_up"] = (df["close"] > df["high"].shift(1).rolling(5).max()) & (df["volume"] > df["volume"].shift(1).rolling(5).mean())
-    df["breakout_down"] = (df["close"] < df["low"].shift(1).rolling(5).min()) & (df["volume"] > df["volume"].shift(1).rolling(5).mean())
     
     df["target"] = 1  # Default là NEUTRAL
     for i in range(len(df)):
-        curr_threshold = df["threshold"].iloc[i]
         curr_close = df["close"].iloc[i]
-        curr_ema_50 = df["ema_50"].iloc[i]
-        curr_breakout_up = df["breakout_up"].iloc[i]
-        curr_breakout_down = df["breakout_down"].iloc[i]
-        curr_rsi = df["rsi"].iloc[i]
+        curr_ema_10 = df["ema_10"].iloc[i]
+        curr_threshold = df["threshold"].iloc[i]
+        curr_future_return = df["future_return"].iloc[i]
         
-        # Gán nhãn dựa trên thông tin quá khứ và hiện tại, thêm điều kiện RSI
-        if (curr_close > curr_ema_50 + curr_threshold) or curr_breakout_up or (curr_rsi > 70 and curr_close > curr_ema_50):
+        if (curr_close > curr_ema_10 + curr_threshold and curr_future_return >= long_threshold):
             df.iloc[i, df.columns.get_loc("target")] = 2  # LONG
-        elif (curr_close < curr_ema_50 - curr_threshold) or curr_breakout_down or (curr_rsi < 30 and curr_close < curr_ema_50):
+        elif (curr_close < curr_ema_10 - curr_threshold and curr_future_return <= short_threshold):
             df.iloc[i, df.columns.get_loc("target")] = 0  # SHORT
     
-    df = df.drop(columns=["threshold", "breakout_up", "breakout_down"], errors='ignore').dropna()
+    # Chỉ xóa future_return và threshold để tránh leakage, giữ ema_10 và atr
+    df = df.drop(columns=["future_return", "threshold"], errors='ignore').dropna()
     
     # Kiểm tra phân phối nhãn
     label_counts = df["target"].value_counts()
     total_samples = len(df)
     label_ratios = label_counts / total_samples
-    logging.info(f"Phân phối nhãn (số lượng): {label_counts}")
-    logging.info(f"Phân phối nhãn (tỷ lệ): {label_ratios}")
+    logging.info(f"Phân phối nhãn - Số lượng: {label_counts}")
+    logging.info(f"Phân phối nhãn - Tỷ lệ: {label_ratios}")
     
-    # Cảnh báo nếu nhãn "LONG" hoặc "SHORT" quá ít
     if label_ratios.get(2, 0) < 0.1 or label_ratios.get(0, 0) < 0.1:
-        logging.warning("Phân phối nhãn không cân bằng: Tỷ lệ LONG hoặc SHORT quá thấp (<10%). Có thể cần điều chỉnh logic gán nhãn.")
+        logging.warning("Phân phối nhãn không cân bằng: Tỷ lệ LONG hoặc SHORT quá thấp (<10%).")
     
     return df
 
-# 4. Chuẩn bị dữ liệu
+# 4. Đánh giá chất lượng nhãn
+def evaluate_label_quality(df, horizon=5, transaction_cost=0.001):
+    logging.info(f"Đánh giá chất lượng nhãn (horizon={horizon} giờ, chi phí giao dịch={transaction_cost*100:.2f}%)...")
+    df = df.copy()
+    df["future_return"] = df["close"].shift(-horizon) / df["close"] - 1
+    df = df.dropna()
+    
+    long_returns = df[df["target"] == 2]["future_return"]
+    short_returns = df[df["target"] == 0]["future_return"]
+    neutral_returns = df[df["target"] == 1]["future_return"]
+    
+    long_returns_adj = long_returns - 2 * transaction_cost
+    short_returns_adj = -short_returns - 2 * transaction_cost
+    neutral_returns_adj = neutral_returns
+    
+    long_avg_return = long_returns_adj.mean() if not long_returns_adj.empty else 0
+    short_avg_return = short_returns_adj.mean() if not short_returns_adj.empty else 0
+    neutral_avg_return = neutral_returns_adj.mean() if not neutral_returns_adj.empty else 0
+    long_success_ratio = (long_returns_adj > 0).mean() if not long_returns_adj.empty else 0
+    short_success_ratio = (short_returns_adj > 0).mean() if not short_returns_adj.empty else 0
+    long_volatility = long_returns_adj.std() if not long_returns_adj.empty else 0
+    short_volatility = short_returns_adj.std() if not short_returns_adj.empty else 0
+    
+    long_sharpe = (long_avg_return / long_volatility) if long_volatility > 0 else 0
+    short_sharpe = (short_avg_return / short_volatility) if short_volatility > 0 else 0
+    
+    def calc_max_drawdown(returns):
+        cumulative = (1 + returns).cumprod()
+        peak = cumulative.cummax()
+        drawdown = (cumulative - peak) / peak
+        return drawdown.min() if not drawdown.empty else 0
+    
+    long_max_dd = calc_max_drawdown(long_returns_adj)
+    short_max_dd = calc_max_drawdown(short_returns_adj)
+    
+    df["ema_10"] = calc_ema_10(df)
+    df.loc[:, "trend"] = np.where(df["close"] > df["ema_10"], "UPTREND", 
+                                  np.where(df["close"] < df["ema_10"], "DOWNTREND", "NEUTRAL"))
+    long_uptrend_success = (df.loc[(df["target"] == 2) & (df["trend"] == "UPTREND"), "future_return"] - 2 * transaction_cost > 0).mean() if not df[(df["target"] == 2) & (df["trend"] == "UPTREND")].empty else 0
+    short_downtrend_success = (-df.loc[(df["target"] == 0) & (df["trend"] == "DOWNTREND"), "future_return"] - 2 * transaction_cost > 0).mean() if not df[(df["target"] == 0) & (df["trend"] == "DOWNTREND")].empty else 0
+    
+    label_counts = df["target"].value_counts()
+    total_samples = len(df)
+    label_ratios = label_counts / total_samples
+    
+    logging.info(f"Phân phối nhãn - Số lượng: {label_counts}")
+    logging.info(f"Phân phối nhãn - Tỷ lệ: {label_ratios}")
+    logging.info(f"Lợi nhuận trung bình (sau {horizon} giờ, đã trừ chi phí giao dịch):")
+    logging.info(f"LONG: {long_avg_return:.4f}, Tỷ lệ thành công: {long_success_ratio:.4f}, Độ biến động: {long_volatility:.4f}")
+    logging.info(f"SHORT: {short_avg_return:.4f}, Tỷ lệ thành công: {short_success_ratio:.4f}, Độ biến động: {short_volatility:.4f}")
+    logging.info(f"NEUTRAL: {neutral_avg_return:.4f}")
+    logging.info(f"Sharpe Ratio - LONG: {long_sharpe:.4f}, SHORT: {short_sharpe:.4f}")
+    logging.info(f"Max Drawdown - LONG: {long_max_dd:.4f}, SHORT: {short_max_dd:.4f}")
+    logging.info(f"Tỷ lệ thành công theo xu hướng - LONG trong UPTREND: {long_uptrend_success:.4f}, SHORT trong DOWNTREND: {short_downtrend_success:.4f}")
+    
+    evaluation = {
+        "label_distribution_ok": (0.20 <= label_ratios.get(2, 0) <= 0.25) and (0.20 <= label_ratios.get(0, 0) <= 0.25) and (0.50 <= label_ratios.get(1, 0) <= 0.60),
+        "long_profit_ok": long_avg_return > 0,
+        "short_profit_ok": short_avg_return > 0,
+        "long_success_ok": long_success_ratio >= 0.6,
+        "short_success_ok": short_success_ratio >= 0.6,
+        "long_trend_ok": long_uptrend_success >= 0.7,
+        "short_trend_ok": short_downtrend_success >= 0.7,
+        "volatility_ok": long_volatility <= 0.1 and short_volatility <= 0.1,
+        "sharpe_ok": long_sharpe >= 0.5 and short_sharpe >= 0,
+        "drawdown_ok": abs(long_max_dd) <= 0.2 and abs(short_max_dd) <= 0.2
+    }
+    
+    logging.info("\nĐánh giá tổng quan:")
+    for key, value in evaluation.items():
+        logging.info(f"{key}: {'OK' if value else 'NOT OK'}")
+    
+    return df, evaluation
+
+# 5. Chuẩn bị dữ liệu
 def prepare_data(df, features, timesteps, horizon):
     logging.info("Bắt đầu chuẩn bị dữ liệu...")
     feature_data = df[features].values
@@ -245,7 +322,7 @@ def prepare_data(df, features, timesteps, horizon):
     logging.info(f"Kích thước dữ liệu: X_train={X_train_scaled.shape}, X_val={X_val_scaled.shape}, X_test={X_test_scaled.shape}")
     return X_train_scaled, y_train, X_val_scaled, y_val, X_test_scaled, y_test, scaler
 
-# 5. Xây dựng mô hình LSTM
+# 6. Xây dựng mô hình LSTM
 def build_lstm_model(input_shape, lstm_units=32, num_heads=8, dropout_rate=0.5):
     inputs = Input(shape=input_shape)
     lstm1 = Bidirectional(LSTM(lstm_units, return_sequences=True, kernel_regularizer=l2(0.01)))(inputs)
@@ -276,7 +353,7 @@ def build_lstm_model(input_shape, lstm_units=32, num_heads=8, dropout_rate=0.5):
     model = Model(inputs=inputs, outputs=outputs)
     return model
 
-# 6. Tối ưu hóa siêu tham số (Thêm atr_multiplier vào Optuna)
+# 7. Tối ưu hóa siêu tham số
 def objective(trial):
     try:
         timesteps = trial.suggest_int("timesteps", 10, 50)
@@ -289,10 +366,10 @@ def objective(trial):
         alpha = [trial.suggest_float("alpha_0", 0.6, 0.8),
                  trial.suggest_float("alpha_1", 0.0, 0.2),
                  trial.suggest_float("alpha_2", 0.6, 0.8)]
-        atr_multiplier = trial.suggest_float("atr_multiplier", 1.0, 3.0)  # Tối ưu hóa hệ số ATR
+        atr_multiplier = trial.suggest_float("atr_multiplier", 0.05, 0.5)  # Tối ưu hóa hệ số ATR
         
         logging.info(f"Tối ưu hóa với timesteps={timesteps}, horizon={horizon}, atr_multiplier={atr_multiplier}")
-        df_trial = define_target(df.copy(), horizon=horizon, atr_multiplier=atr_multiplier)
+        df_trial = define_target_new(df.copy(), horizon=horizon, atr_multiplier=atr_multiplier)
         X_train, y_train, X_val, y_val, _, _, _ = prepare_data(df_trial, features, timesteps, horizon)
         if X_train.shape[0] == 0 or X_val.shape[0] == 0:
             raise ValueError("Dữ liệu rỗng sau khi xử lý!")
@@ -314,7 +391,7 @@ def objective(trial):
         logging.error(f"Error in trial: {str(e)}")
         return -1
 
-# 7. Huấn luyện và đánh giá
+# 8. Huấn luyện và đánh giá
 def train_and_evaluate(X, y, best_params, features, timesteps, horizon):
     logging.info("Bắt đầu huấn luyện và đánh giá mô hình cuối cùng...")
     
@@ -452,27 +529,32 @@ def train_and_evaluate(X, y, best_params, features, timesteps, horizon):
     logging.info(f"Average ROC-AUC across folds: {np.mean(roc_aucs):.3f} ± {np.std(roc_aucs):.3f}")
     return lstm_model, scaler
 
-# 8. Pipeline chính
+# 9. Pipeline chính
 if __name__ == "__main__":
     try:
         df = load_data()
         df = add_features(df)
         
         features = ["price_change", "rsi", "adx", "adx_pos", "adx_neg", "stoch", "momentum", "awesome", 
-                    "macd", "bb_upper", "bb_lower", "vwap", "ema_20", "ema_50", "ema_200", "obv", 
+                    "macd", "bb_upper", "bb_lower", "vwap", "ema_10", "ema_20", "ema_50", "ema_200", "obv", 
                     "roc", "mfi", "vol_breakout", "vol_delta", "rolling_mean_5", "rolling_std_5", 
                     "lag_1", "hour_sin", "hour_cos", "dayofweek_sin", "dayofweek_cos", "atr"]
         
+        # Đánh giá nhãn trước khi tối ưu hóa
+        df_labeled = define_target_new(df, horizon=5, atr_multiplier=0.1)
+        df_evaluated, evaluation = evaluate_label_quality(df_labeled, horizon=5)
+        
+        # Tối ưu hóa siêu tham số
         study = optuna.create_study(direction="maximize", sampler=TPESampler(n_startup_trials=20, multivariate=True, seed=42))
         study.optimize(objective, n_trials=100)
         best_params = study.best_params
         logging.info(f"Best Params: {best_params}")
         
-        # Chuẩn bị dữ liệu toàn bộ để backtesting
+        # Chuẩn bị dữ liệu toàn bộ để backtesting với tham số tốt nhất
         timesteps = best_params["timesteps"]
         horizon = best_params["horizon"]
         atr_multiplier = best_params["atr_multiplier"]
-        df = define_target(df, horizon=horizon, atr_multiplier=atr_multiplier)
+        df = define_target_new(df, horizon=horizon, atr_multiplier=atr_multiplier)
         
         feature_data = df[features].values
         X = np.lib.stride_tricks.sliding_window_view(feature_data, (timesteps, len(features))).squeeze().copy()
