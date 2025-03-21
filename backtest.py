@@ -5,227 +5,303 @@ from scipy.stats import skewnorm, pareto
 from sklearn.preprocessing import RobustScaler
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
-from ta import add_all_ta_features
+from ta.trend import ADXIndicator, MACD, EMAIndicator
+from ta.momentum import RSIIndicator, StochasticOscillator, awesome_oscillator, ROCIndicator
+from ta.volatility import BollingerBands, AverageTrueRange
+from ta.volume import volume_weighted_average_price, OnBalanceVolumeIndicator, MFIIndicator
 
-plt.style.use('seaborn')
+# Thiết lập kiểu biểu đồ
+plt.style.use('default')
 plt.rcParams['figure.figsize'] = [15, 10]
+
+# Định nghĩa focal loss
+def focal_loss_fn(y_true, y_pred, gamma=5.5888, alpha=0.25):
+    y_true = tf.cast(y_true, tf.float32)
+    ce_loss = tf.keras.losses.sparse_categorical_crossentropy(y_true, y_pred, from_logits=False)
+    p_t = tf.reduce_sum(y_true * y_pred, axis=-1)
+    focal_weight = tf.pow(1.0 - p_t, gamma)
+    return tf.reduce_mean(focal_weight * alpha * ce_loss)
 
 class EnhancedBacktestConfig:
     def __init__(self):
-        # Thiết lập tài khoản
-        self.initial_equity = 10000.0       # Vốn ban đầu (USD)
-        self.risk_per_trade = 0.02          # % vốn mạo hiểm mỗi lệnh
-        self.min_leverage = 30              # Đòn bẩy tối thiểu
-        self.max_leverage = 75              # Đòn bẩy tối đa
-        self.leverage_smoothing_window = 6  # Cửa sổ làm mịn đòn bẩy (giờ)
-        
-        # Chi phí giao dịch
-        self.taker_fee = 0.0004             # Phí maker/taker
+        self.initial_equity = 10000.0
+        self.risk_per_trade = 0.02
+        self.min_leverage = 30
+        self.max_leverage = 75
+        self.leverage_smoothing_window = 6
+        self.taker_fee = 0.0004
         self.maker_fee = 0.0002
-        self.slippage_shape_param = 3.5     # Tham số hình dạng phân phối trượt giá
-        
-        # Quản lý rủi ro
-        self.maintenance_margin = 0.005     # 0.5% margin duy trì
-        self.stop_loss = 0.03               # 3% stop loss
-        self.take_profit = 0.06             # 6% take profit
-        self.max_daily_loss = 0.15          # Tối đa thua lỗ 15%/ngày
-        self.liquidity_impact_factor = 0.001 # Ảnh hưởng thanh khoản
-        
-        # Thông số mô hình
-        self.model_path = "lstm_model.keras"
+        self.slippage_shape_param = 3.5
+        self.maintenance_margin = 0.005
+        self.stop_loss = 0.03
+        self.take_profit = 0.06
+        self.max_daily_loss = 0.15
+        self.liquidity_impact_factor = 0.001
+        self.model_path = "lstm_model.h5"
         self.scaler_path = "scaler.npy"
-        self.timesteps = 24
+        self.timesteps = 13
         self.horizon = 6
         self.features = [
-            "price_change", "rsi", "adx", "adx_pos", "adx_neg", "stoch", 
+            "price_change", "rsi", "adx", "adx_pos", "adx_neg", "stoch",
             "momentum", "awesome", "macd", "bb_upper", "bb_lower", "vwap",
             "ema_10", "ema_20", "ema_50", "ema_200", "obv", "roc", "mfi",
             "vol_breakout", "vol_delta", "rolling_mean_5", "rolling_std_5",
-            "lag_1", "hour_sin", "hour_cos", "dayofweek_sin", "dayofweek_cos", "atr"
+            "lag_1", "hour_sin", "hour_cos", "dayofweek_sin", "dayofweek_cos", "atr",
+            "rsi_macd_interaction"
         ]
 
 class SmartFuturesTradingEngine:
     def __init__(self, config):
         self.config = config
-        self.model = tf.keras.models.load_model(config.model_path)
+        with tf.keras.utils.custom_object_scope({'focal_loss_fn': focal_loss_fn}):
+            self.model = tf.keras.models.load_model(config.model_path)
         self.scaler = np.load(config.scaler_path, allow_pickle=True).item()
         self.reset()
-    
+
     def reset(self):
-        # Trạng thái tài khoản
         self.equity = self.config.initial_equity
         self.balance = self.config.initial_equity
         self.margin = 0.0
         self.leverage = 30
-        self.daily_pnl = []
-        
-        # Lịch sử giao dịch
         self.positions = []
-        self.trade_history = []
-        self.current_position = None
-        self.historical_data = []
-        
-        # Theo dõi hiệu suất
         self.portfolio_values = [self.equity]
         self.max_drawdown = 0
         self.peak = self.equity
         self.avg_liquidity = None
-        self.liquidity_zones = None
+        self.current_position = None
 
-    def calculate_dynamic_leverage(self, volatility_series):
-        """Đòn bẩy động với làm mịn EMA"""
-        smoothed_volatility = volatility_series.dropna().ewm(span=self.config.leverage_smoothing_window).mean().iloc[-1]
-        
-        # Hàm chuyển đổi phi tuyến tính
+    def calculate_dynamic_leverage(self, volatility):
+        smoothed_volatility = pd.Series([volatility]).ewm(span=self.config.leverage_smoothing_window).mean().iloc[-1]
         leverage_range = self.config.max_leverage - self.config.min_leverage
-        leverage = self.config.min_leverage + leverage_range / (1 + np.exp(10*(smoothed_volatility - 0.015)))
-        
+        leverage = self.config.min_leverage + leverage_range / (1 + np.exp(10 * (smoothed_volatility - 0.015)))
         return np.clip(leverage, self.config.min_leverage, self.config.max_leverage)
 
     def calculate_position_size(self, price, liquidity):
-        """Tính toán vị thế với độ sâu thanh khoản"""
         risk_amount = self.equity * self.config.risk_per_trade
         base_size = (risk_amount * self.leverage) / (price * self.config.stop_loss)
-        
-        # Điều chỉnh theo thanh khoản
-        liquidity_ratio = liquidity / self.avg_liquidity if self.avg_liquidity != 0 else 0
+        liquidity_ratio = liquidity / self.avg_liquidity if self.avg_liquidity else 1
         liquidity_adjustment = 1 - np.exp(-self.config.liquidity_impact_factor * liquidity_ratio)
-        
         return base_size * liquidity_adjustment
 
     def apply_slippage(self, price, is_entry=True):
-        """Phân phối trượt giá lệch với đuôi nặng"""
         base_spread = price * 0.0005
         if self.current_position:
             if is_entry:
-                # Phân phối Pareto cho entry 
                 slippage = pareto.rvs(self.config.slippage_shape_param) * base_spread
                 return price + slippage if self.current_position['type'] == 'LONG' else price - slippage
             else:
-                # Phân phối lệch chuẩn cho exit
                 slippage = skewnorm.rvs(5, loc=base_spread, scale=base_spread/2)
                 return price - slippage if self.current_position['type'] == 'LONG' else price + slippage
-        else:
-            return price
+        return price
 
-    def update_real_time_pnl(self, current_price):
-        """Cập nhật PnL thời gian thực"""
+    def update_pnl(self, current_price):
         if self.current_position and not self.current_position['closed']:
             if self.current_position['type'] == 'LONG':
                 unrealized_pnl = (current_price - self.current_position['entry_price']) * self.current_position['size']
             else:
                 unrealized_pnl = (self.current_position['entry_price'] - current_price) * self.current_position['size']
-            
-            # Cập nhật equity và margin
             self.equity = self.balance + self.margin + unrealized_pnl
             self.portfolio_values.append(self.equity)
-            
-            # Cập nhật drawdown
             self.peak = max(self.peak, self.equity)
-            self.max_drawdown = max(self.max_drawdown, (self.peak - self.equity)/self.peak)
+            self.max_drawdown = max(self.max_drawdown, (self.peak - self.equity) / self.peak)
 
-    def calculate_liquidity_zones(self, df):
-        """Xác định vùng thanh khoản dùng Volume Profile"""
-        vp = df.groupby(pd.cut(df.index.hour, bins=24))['volume'].mean()
-        self.liquidity_zones = {
-            'support': df['low'].rolling(24).mean(),
-            'resistance': df['high'].rolling(24).mean(),
-            'volume_profile': vp.reindex(df.index, method='ffill')
-        }
+    def check_liquidation(self, current_price):
+        if self.current_position and not self.current_position['closed']:
+            if self.current_position['type'] == 'LONG':
+                loss = (self.current_position['entry_price'] - current_price) / self.current_position['entry_price']
+            else:
+                loss = (current_price - self.current_position['entry_price']) / self.current_position['entry_price']
+            return loss >= (1 / self.current_position['leverage'] - self.config.maintenance_margin)
+        return False
 
-    def plot_enhanced_results(self, df):
-        fig, ax = plt.subplots(4, 1, gridspec_kw={'height_ratios': [3, 1, 1, 1]})
-        
-        # Biểu đồ giá với vùng thanh khoản
-        ax[0].plot(df['close'], label='Price')
-        ax[0].plot(self.liquidity_zones['support'], '--', color='green', alpha=0.5, label='Support')
-        ax[0].plot(self.liquidity_zones['resistance'], '--', color='red', alpha=0.5, label='Resistance')
-        ax[0].fill_between(df.index, 
-                         self.liquidity_zones['volume_profile'].quantile(0.25), 
-                         self.liquidity_zones['volume_profile'].quantile(0.75), 
-                         color='gray', alpha=0.2, label='Liquidity Zone')
-        
-        # Biểu đồ equity và drawdown
-        ax[1].plot(self.portfolio_values, label='Equity Curve')
-        ax[1].fill_between(range(len(self.portfolio_values)), 
-                         self.portfolio_values, 
-                         self.peak * np.ones(len(self.portfolio_values)), 
-                         color='red', alpha=0.3, label='Drawdown')
-        ax[1].legend()
-        
-        # Biểu đồ đòn bẩy
-        leverage_timeline = [{'time': p['entry_time'], 'leverage': p['leverage']} for p in self.positions]
-        leverage_df = pd.DataFrame(leverage_timeline).set_index('time')
-        ax[2].bar(leverage_df.index, leverage_df['leverage'], width=0.01, color='purple', label='Leverage')
-        ax[2].xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m-%d'))
-        ax[2].legend()
-        
-        # Biểu đồ PnL theo thời gian
-        pnl_timeline = [{'time': p['exit_time'], 'pnl': p['pnl']} for p in self.positions]
-        pnl_df = pd.DataFrame(pnl_timeline).set_index('time')
-        ax[3].bar(pnl_df.index, pnl_df['pnl'], width=0.01, color='blue', label='PnL')
-        ax[3].xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m-%d'))
-        ax[3].legend()
-        
-        plt.tight_layout()
-        plt.show()
+    def close_position(self, current_data):
+        if self.current_position and not self.current_position['closed']:
+            exit_price = self.apply_slippage(current_data['close'], is_entry=False)
+            fee = self.current_position['size'] * exit_price * self.config.taker_fee
+            if self.current_position['type'] == 'LONG':
+                pnl = (exit_price - self.current_position['entry_price']) * self.current_position['size'] - fee
+            else:
+                pnl = (self.current_position['entry_price'] - exit_price) * self.current_position['size'] - fee
+            
+            self.current_position['exit_price'] = exit_price
+            self.current_position['exit_time'] = current_data.name
+            self.current_position['pnl'] = pnl
+            self.current_position['closed'] = True
+            self.balance += pnl
+            self.margin = 0
+            self.positions.append(self.current_position)
+            self.current_position = None
+
+    def execute_trade(self, signal, current_data):
+        if not self.current_position and signal != 1:  # 1 là NEUTRAL
+            volatility = current_data['atr']
+            self.leverage = self.calculate_dynamic_leverage(volatility)
+            position_size = self.calculate_position_size(current_data['close'], current_data['volume'])
+            entry_price = self.apply_slippage(current_data['close'], is_entry=True)
+            fee = position_size * entry_price * self.config.taker_fee
+            
+            position = {
+                'type': 'LONG' if signal == 2 else 'SHORT',
+                'entry_price': entry_price,
+                'ideal_price': current_data['close'],
+                'size': position_size,
+                'entry_time': current_data.name,
+                'leverage': self.leverage,
+                'liquidity_ratio': current_data['volume'] / self.avg_liquidity if self.avg_liquidity else 1,
+                'closed': False,
+                'pnl': 0
+            }
+            self.current_position = position
+            self.margin = (position_size * entry_price) / self.leverage
+            self.balance -= fee
+
+        elif self.current_position and not self.current_position['closed']:
+            current_price = current_data['close']
+            entry_price = self.current_position['entry_price']
+            if self.current_position['type'] == 'LONG':
+                if current_price >= entry_price * (1 + self.config.take_profit) or current_price <= entry_price * (1 - self.config.stop_loss):
+                    self.close_position(current_data)
+            else:
+                if current_price <= entry_price * (1 - self.config.take_profit) or current_price >= entry_price * (1 + self.config.stop_loss):
+                    self.close_position(current_data)
 
     def run_backtest(self, data):
-        # Thêm tính toán thanh khoản
         self.avg_liquidity = data['volume'].rolling(24).mean().median()
-        self.calculate_liquidity_zones(data)
-        
-        # Vòng lặp chính với cập nhật thời gian thực
+
         for idx in range(len(data)):
             current_data = data.iloc[idx]
-            self.update_real_time_pnl(current_data['close'])
-            
-            # Kiểm tra liquidation
+            self.update_pnl(current_data['close'])
+
             if self.current_position and not self.current_position['closed']:
                 if self.check_liquidation(current_data['close']):
                     self.close_position(current_data)
-                    
-            # Thực thi lệnh mới
-            if idx in range(self.config.timesteps + self.config.horizon, len(data)):
-                signal = self.model.predict(np.expand_dims(self.scaler.transform(data[self.config.features].iloc[idx-self.config.timesteps:idx]), axis=0))
+
+            if idx >= self.config.timesteps + self.config.horizon:
+                input_data = data[self.config.features].iloc[idx - self.config.timesteps:idx]
+                # Chuyển DataFrame thành mảng numpy để loại bỏ tên cột
+                scaled_input = self.scaler.transform(input_data.to_numpy())
+                signal = self.model.predict(np.expand_dims(scaled_input, axis=0), verbose=0)
                 signal = np.argmax(signal, axis=1)[0]
                 self.execute_trade(signal, current_data)
-                
-            # Cập nhật PnL hàng giờ
-            if self.current_position and not self.current_position['closed']:
-                self.update_unrealized_pnl(current_data['close'])
-        
-        return self.generate_enhanced_report()
 
-    def generate_enhanced_report(self):
+        return self.generate_report()
+
+    def generate_report(self):
+        total_trades = len(self.positions)
+        if total_trades == 0:
+            return {
+                'final_equity': self.equity,
+                'total_return': 0,
+                'sharpe_ratio': 0,
+                'max_drawdown': 0,
+                'win_rate': 0,
+                'profit_factor': 0,
+                'max_leverage_used': 0,
+                'avg_slippage': 0,
+                'liquidity_impact': 0
+            }
+
         report = {
             'final_equity': self.equity,
             'total_return': (self.equity / self.config.initial_equity - 1) * 100,
-            'sharpe_ratio': np.sqrt(365*24) * np.mean(np.diff(self.portfolio_values)) / np.std(np.diff(self.portfolio_values)),
+            'sharpe_ratio': (np.sqrt(365 * 24) * np.mean(np.diff(self.portfolio_values)) / 
+                            np.std(np.diff(self.portfolio_values))) if np.std(np.diff(self.portfolio_values)) != 0 else 0,
             'max_drawdown': self.max_drawdown * 100,
-            'win_rate': len([p for p in self.positions if p['pnl'] > 0]) / len(self.positions),
-            'profit_factor': sum(p['pnl'] for p in self.positions if p['pnl'] > 0) / 
-                            abs(sum(p['pnl'] for p in self.positions if p['pnl'] < 0)),
-            'max_leverage_used': max([p['leverage'] for p in self.positions]),
-            'avg_slippage': np.mean([abs(p['entry_price']/p['ideal_price']-1) for p in self.positions]),
-            'liquidity_impact': np.mean([p['liquidity_ratio'] for p in self.positions]),
-            'realized_vs_unrealized': sum(p['pnl'] for p in self.positions)/self.portfolio_values[-1]
+            'win_rate': len([p for p in self.positions if p['pnl'] > 0]) / total_trades,
+            'profit_factor': (sum(p['pnl'] for p in self.positions if p['pnl'] > 0) / 
+                             abs(sum(p['pnl'] for p in self.positions if p['pnl'] < 0))) if any(p['pnl'] < 0 for p in self.positions) else float('inf'),
+            'max_leverage_used': max([p['leverage'] for p in self.positions]) if self.positions else 0,
+            'avg_slippage': np.mean([abs(p['entry_price'] / p['ideal_price'] - 1) for p in self.positions]) * 100 if self.positions else 0,
+            'liquidity_impact': np.mean([p['liquidity_ratio'] for p in self.positions]) if self.positions else 0
         }
         return report
 
-# Sử dụng
+    def plot_results(self, df):
+        fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(15, 10), sharex=True)
+
+        # Biểu đồ giá
+        ax1.plot(df.index, df['close'], label='Price', color='blue')
+        ax1.set_title('Price')
+        ax1.legend()
+
+        # Biểu đồ equity
+        ax2.plot(range(len(self.portfolio_values)), self.portfolio_values, label='Equity', color='green')
+        ax2.set_title('Equity Curve')
+        ax2.legend()
+
+        # Biểu đồ PnL
+        pnl_timeline = [{'time': p['exit_time'], 'pnl': p['pnl']} for p in self.positions if p['closed']]
+        if pnl_timeline:
+            pnl_df = pd.DataFrame(pnl_timeline).set_index('time')
+            ax3.bar(pnl_df.index, pnl_df['pnl'], width=0.01, color='blue', label='PnL')
+            ax3.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m-%d'))
+        ax3.set_title('Profit and Loss')
+        ax3.legend()
+
+        plt.tight_layout()
+        plt.show()
+
+def add_features(df):
+    df = df.copy()
+    df["price_change"] = df["close"].pct_change().shift(1).fillna(0)
+    df["rsi"] = RSIIndicator(close=df["close"], window=14).rsi().shift(1).fillna(50)
+    df["adx"] = ADXIndicator(high=df["high"], low=df["low"], close=df["close"], window=14).adx().shift(1).fillna(25)
+    df["adx_pos"] = ADXIndicator(high=df["high"], low=df["low"], close=df["close"], window=14).adx_pos().shift(1).fillna(0)
+    df["adx_neg"] = ADXIndicator(high=df["high"], low=df["low"], close=df["close"], window=14).adx_neg().shift(1).fillna(0)
+    df["stoch"] = StochasticOscillator(high=df["high"], low=df["low"], close=df["close"], window=14, smooth_window=3).stoch().shift(1).fillna(50)
+    df["momentum"] = df["close"].diff(5).shift(1).fillna(0)
+    df["awesome"] = awesome_oscillator(high=df["high"], low=df["low"], window1=5, window2=34).shift(1).fillna(0)
+    df["macd"] = MACD(close=df["close"], window_slow=26, window_fast=12, window_sign=9).macd_diff().shift(1).fillna(0)
+    df["bb_upper"] = BollingerBands(close=df["close"], window=20, window_dev=2).bollinger_hband().shift(1).fillna(0)
+    df["bb_lower"] = BollingerBands(close=df["close"], window=20, window_dev=2).bollinger_lband().shift(1).fillna(0)
+    df["vwap"] = volume_weighted_average_price(high=df["high"], low=df["low"], close=df["close"], volume=df["volume"], window=14).shift(1).fillna(0)
+    df["ema_10"] = EMAIndicator(close=df["close"], window=10).ema_indicator().shift(1).fillna(0)
+    df["ema_20"] = EMAIndicator(close=df["close"], window=20).ema_indicator().shift(1).fillna(0)
+    df["ema_50"] = EMAIndicator(close=df["close"], window=50).ema_indicator().shift(1).fillna(0)
+    df["ema_200"] = EMAIndicator(close=df["close"], window=200).ema_indicator().shift(1).fillna(0)
+    df["obv"] = OnBalanceVolumeIndicator(close=df["close"], volume=df["volume"]).on_balance_volume().shift(1).fillna(0)
+    df["roc"] = ROCIndicator(close=df["close"], window=14).roc().shift(1).fillna(0)
+    df["mfi"] = MFIIndicator(high=df["high"], low=df["low"], close=df["close"], volume=df["volume"], window=14).money_flow_index().shift(1).fillna(50)
+    df["atr"] = AverageTrueRange(high=df["high"], low=df["low"], close=df["close"], window=5).average_true_range().shift(1).fillna(0)
+    df["hour_sin"] = np.sin(2 * np.pi * df.index.hour / 24)
+    df["hour_cos"] = np.cos(2 * np.pi * df.index.hour / 24)
+    df["dayofweek_sin"] = np.sin(2 * np.pi * df.index.dayofweek / 7)
+    df["dayofweek_cos"] = np.cos(2 * np.pi * df.index.dayofweek / 7)
+    df["vol_breakout"] = ((df["high"] - df["low"]) / df["high"].shift(1)).shift(1).fillna(0)
+    df["vol_delta"] = df["obv"].diff().shift(1).fillna(0)
+    df["rolling_mean_5"] = df["close"].rolling(window=5).mean().shift(1).fillna(0)
+    df["rolling_std_5"] = df["close"].rolling(window=5).std().shift(1).fillna(0)
+    df["lag_1"] = df["close"].shift(1).fillna(0)
+    df["rsi_macd_interaction"] = (df["rsi"] * df["macd"]).shift(1).fillna(0)
+    df = df.replace([np.inf, -np.inf], np.nan).ffill().bfill()
+    return df
+
 if __name__ == "__main__":
-    config = EnhancedBacktestConfig()
-    engine = SmartFuturesTradingEngine(config)
-    
-    # Load dữ liệu
-    raw_data = pd.read_csv("binance_BTCUSDT_1h.csv", parse_dates=["timestamp"], index_col="timestamp")
-    report = engine.run_backtest(raw_data)
-    
-    print("\n=== Enhanced Backtest Report ===")
-    print(f"Final Equity: ${report['final_equity']:,.2f}")
-    print(f"Total Return: {report['total_return']:.2f}%")
-    print(f"Max Leverage Used: {report['max_leverage_used']:.1f}x")
-    print(f"Average Slippage: {report['avg_slippage']:.4f}%")
-    print(f"Liquidity Impact: {report['liquidity_impact']:.2f}")
-    print(f"Realized/Unrealized PnL Ratio: {report['realized_vs_unrealized']:.2f}")
+    try:
+        # Load dữ liệu
+        raw_data = pd.read_csv("binance_BTCUSDT_1h.csv", parse_dates=["timestamp"], index_col="timestamp")
+        raw_data = raw_data[["open", "high", "low", "close", "volume"]].apply(pd.to_numeric, errors='coerce')
+        data = add_features(raw_data)
+
+        # Khởi tạo và chạy backtest
+        config = EnhancedBacktestConfig()
+        engine = SmartFuturesTradingEngine(config)
+        report = engine.run_backtest(data)
+
+        # In báo cáo
+        print("\n=== Backtest Report ===")
+        print(f"Final Equity: ${report['final_equity']:,.2f}")
+        print(f"Total Return: {report['total_return']:.2f}%")
+        print(f"Sharpe Ratio: {report['sharpe_ratio']:.2f}")
+        print(f"Max Drawdown: {report['max_drawdown']:.2f}%")
+        print(f"Win Rate: {report['win_rate']:.2f}")
+        print(f"Profit Factor: {report['profit_factor']:.2f}")
+        print(f"Max Leverage Used: {report['max_leverage_used']:.1f}x")
+        print(f"Average Slippage: {report['avg_slippage']:.4f}%")
+        print(f"Liquidity Impact: {report['liquidity_impact']:.2f}")
+
+        # Vẽ biểu đồ
+        engine.plot_results(data)
+
+    except Exception as e:
+        print(f"Error occurred: {str(e)}")
