@@ -356,6 +356,10 @@ def build_lstm_model(input_shape, lstm_units=32, num_heads=8, dropout_rate=0.5):
 # 7. Tối ưu hóa siêu tham số
 def objective(trial):
     try:
+        # Ghi log bắt đầu trial
+        logging.info(f"Starting Trial {trial.number}")
+        
+        # Lấy các siêu tham số
         timesteps = trial.suggest_int("timesteps", 10, 50)
         horizon = trial.suggest_int("horizon", 2, 5)
         lstm_units = trial.suggest_int("lstm_units", 16, 128)
@@ -366,29 +370,40 @@ def objective(trial):
         alpha = [trial.suggest_float("alpha_0", 0.6, 0.8),
                  trial.suggest_float("alpha_1", 0.0, 0.2),
                  trial.suggest_float("alpha_2", 0.6, 0.8)]
-        atr_multiplier = trial.suggest_float("atr_multiplier", 0.05, 0.5)  # Tối ưu hóa hệ số ATR
+        atr_multiplier = trial.suggest_float("atr_multiplier", 0.05, 0.5)
         
-        logging.info(f"Tối ưu hóa với timesteps={timesteps}, horizon={horizon}, atr_multiplier={atr_multiplier}")
+        # Ghi log các siêu tham số
+        logging.info(f"Trial {trial.number} Params: timesteps={timesteps}, horizon={horizon}, lstm_units={lstm_units}, "
+                     f"num_heads={num_heads}, dropout_rate={dropout_rate:.4f}, learning_rate={learning_rate:.6f}, "
+                     f"gamma={gamma:.4f}, alpha={alpha}, atr_multiplier={atr_multiplier:.4f}")
+
+        # Chuẩn bị dữ liệu
         df_trial = define_target_new(df.copy(), horizon=horizon, atr_multiplier=atr_multiplier)
         X_train, y_train, X_val, y_val, _, _, _ = prepare_data(df_trial, features, timesteps, horizon)
         if X_train.shape[0] == 0 or X_val.shape[0] == 0:
             raise ValueError("Dữ liệu rỗng sau khi xử lý!")
         
+        # Xây dựng và huấn luyện mô hình
         lstm_model = build_lstm_model((timesteps, len(features)), lstm_units, num_heads, dropout_rate)
         lstm_model.compile(optimizer=AdamW(learning_rate=learning_rate, weight_decay=1e-4), 
                           loss=focal_loss(gamma=gamma, alpha=alpha), metrics=["accuracy"])
         
         callbacks = [EarlyStopping(patience=15, restore_best_weights=True), ReduceLROnPlateau(factor=0.5, patience=5)]
         class_weight = {0: 10.0, 1: 1.0, 2: 10.0}
-        lstm_model.fit(X_train, y_train, validation_data=(X_val, y_val), epochs=50, batch_size=64, callbacks=callbacks, class_weight=class_weight, verbose=0)
+        lstm_model.fit(X_train, y_train, validation_data=(X_val, y_val), epochs=50, batch_size=64, 
+                       callbacks=callbacks, class_weight=class_weight, verbose=0)
         
+        # Dự đoán và tính F1-score
         lstm_val_pred = lstm_model.predict(X_val, verbose=0)
         y_pred = np.argmax(lstm_val_pred, axis=1)
         f1 = f1_score(y_val, y_pred, average="weighted")
-        logging.info(f"Trial hoàn thành với F1-score: {f1}")
+        
+        # Ghi log kết quả
+        logging.info(f"Trial {trial.number} completed successfully with F1-score: {f1:.4f}")
         return f1
     except Exception as e:
-        logging.error(f"Error in trial: {str(e)}")
+        # Ghi log lỗi nếu trial thất bại
+        logging.error(f"Trial {trial.number} failed with error: {str(e)}")
         return -1
 
 # 8. Huấn luyện và đánh giá
@@ -444,11 +459,11 @@ def train_and_evaluate(X, y, best_params, features, timesteps, horizon):
         y_pred_mc = np.argmax(predictions, axis=1)
         
         # Thêm SHAP values để giải thích dự đoán
-        explainer = shap.DeepExplainer(lstm_model, X_train[:100])
-        shap_values = explainer.shap_values(X_test[:50])
-        shap.summary_plot(shap_values, X_test[:50], feature_names=features, plot_type="bar", show=False)
-        plt.savefig(f"shap_summary_fold_{fold + 1}.png")
-        plt.close()
+        # explainer = shap.DeepExplainer(lstm_model, X_train[:100])
+        # shap_values = explainer.shap_values(X_test[:50])
+        # shap.summary_plot(shap_values, X_test[:50], feature_names=features, plot_type="bar", show=False)
+        # plt.savefig(f"shap_summary_fold_{fold + 1}.png")
+        # plt.close()
         
         # Báo cáo phân loại
         report = classification_report(y_test, y_pred_mc, target_names=["SHORT", "NEUTRAL", "LONG"], zero_division=1)
@@ -547,8 +562,20 @@ if __name__ == "__main__":
         # Tối ưu hóa siêu tham số
         study = optuna.create_study(direction="maximize", sampler=TPESampler(n_startup_trials=20, multivariate=True, seed=42))
         study.optimize(objective, n_trials=100)
+        
+        # Ghi log chi tiết trial tốt nhất
+        best_trial = study.best_trial
+        logging.info(f"Best Trial: {best_trial.number}")
+        logging.info(f"Best Params: {best_trial.params}")
+        logging.info(f"Best F1-score: {best_trial.value:.4f}")
+        
+        # Lưu toàn bộ trials vào CSV
+        trials_df = study.trials_dataframe()
+        trials_df.to_csv("optuna_trials_log.csv", index=False)
+        logging.info("Saved all Optuna trials to 'optuna_trials_log.csv'")
+        
         best_params = study.best_params
-        logging.info(f"Best Params: {best_params}")
+        logging.info(f"Tham số tối ưu: Horizon = {best_params['horizon']}, Timesteps = {best_params['timesteps']}")
         
         # Chuẩn bị dữ liệu toàn bộ để backtesting với tham số tốt nhất
         timesteps = best_params["timesteps"]
@@ -558,7 +585,7 @@ if __name__ == "__main__":
         
         feature_data = df[features].values
         X = np.lib.stride_tricks.sliding_window_view(feature_data, (timesteps, len(features))).squeeze().copy()
-        y = df["target"].values[timesteps-1:].astype(int)  # Cast y về int
+        y = df["target"].values[timesteps-1:].astype(int)
         
         if len(X) != len(y):
             min_len = min(len(X), len(y))
