@@ -9,9 +9,7 @@ from tensorflow.keras.optimizers import AdamW
 from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
 from tensorflow.keras.regularizers import l2
 from sklearn.preprocessing import RobustScaler
-from sklearn.model_selection import TimeSeriesSplit
-from sklearn.metrics import classification_report, confusion_matrix, f1_score, precision_recall_curve, roc_auc_score, roc_curve
-import matplotlib.pyplot as plt
+from sklearn.metrics import f1_score
 import logging
 import optuna
 from optuna.samplers import TPESampler
@@ -19,8 +17,9 @@ from ta.trend import ADXIndicator, MACD, EMAIndicator
 from ta.momentum import RSIIndicator, StochasticOscillator, awesome_oscillator, ROCIndicator
 from ta.volatility import BollingerBands, AverageTrueRange
 from ta.volume import volume_weighted_average_price, OnBalanceVolumeIndicator, MFIIndicator
-from scipy.stats import skew
-import shap
+
+# In phiên bản TensorFlow
+print(f"TensorFlow Version: {tf.__version__}")
 
 # Cấu hình logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -36,567 +35,310 @@ def focal_loss(gamma=5.0, alpha=[0.7, 0.1, 0.7]):
         p_t = tf.reduce_sum(y_true_one_hot * y_pred, axis=-1)
         focal_weight = tf.pow(1 - p_t, gamma)
         alpha_weight = tf.reduce_sum(y_true_one_hot * tf.constant(alpha, dtype=tf.float32), axis=-1)
-        focal_loss = alpha_weight * focal_weight * ce_loss
-        return tf.reduce_mean(focal_loss)
+        return tf.reduce_mean(alpha_weight * focal_weight * ce_loss)
     return focal_loss_fn
 
-# 1. Load dữ liệu từ CSV
+# 1. Load dữ liệu
 def load_data(file_path="binance_BTCUSDT_1h.csv"):
     try:
         df = pd.read_csv(file_path, parse_dates=["timestamp"])
+        logging.info(f"Kích thước dữ liệu gốc: {df.shape}")
         df.set_index("timestamp", inplace=True)
         df = df[["open", "high", "low", "close", "volume"]].apply(pd.to_numeric, errors='coerce')
         df = df.ffill().bfill()
-        df = df.resample('1h').agg({
-            'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last', 'volume': 'sum'
-        }).dropna()
-        if df.empty:
-            raise ValueError("Dữ liệu sau khi xử lý là rỗng!")
+        logging.info(f"Kích thước sau khi xử lý: {df.shape}")
         if len(df) < 5000:
-            logging.warning(f"Dữ liệu chỉ có {len(df)} mẫu, nhỏ hơn yêu cầu 5000 mẫu. Chương trình vẫn chạy nhưng có thể không tối ưu.")
-        elif len(df) < 50:
-            raise ValueError(f"Dữ liệu quá nhỏ ({len(df)} mẫu), không đủ cho timesteps từ 10-50!")
-        logging.info(f"Kích thước dữ liệu: {df.shape}")
+            logging.warning(f"Dữ liệu chỉ có {len(df)} mẫu, có thể không tối ưu.")
         return df
-    except FileNotFoundError:
-        logging.error(f"Không tìm thấy file: {file_path}")
-        raise
-    except pd.errors.EmptyDataError:
-        logging.error(f"File {file_path} rỗng hoặc không chứa dữ liệu hợp lệ!")
-        raise
     except Exception as e:
         logging.error(f"Lỗi khi tải dữ liệu: {str(e)}")
         raise
 
-# 2. Các hàm tính toán đặc trưng (Đảm bảo không có leakage)
-def calc_rsi(df):
-    return RSIIndicator(close=df["close"], window=14).rsi().shift(1).fillna(50)
-
-def calc_adx(df):
-    return ADXIndicator(high=df["high"], low=df["low"], close=df["close"], window=14).adx().shift(1).fillna(25)
-
-def calc_adx_pos(df):
-    return ADXIndicator(high=df["high"], low=df["low"], close=df["close"], window=14).adx_pos().shift(1).fillna(0)
-
-def calc_adx_neg(df):
-    return ADXIndicator(high=df["high"], low=df["low"], close=df["close"], window=14).adx_neg().shift(1).fillna(0)
-
-def calc_stoch(df):
-    return StochasticOscillator(high=df["high"], low=df["low"], close=df["close"], window=14, smooth_window=3).stoch().shift(1).fillna(50)
-
-def calc_momentum(df):
-    return df["close"].diff(5).shift(1).fillna(0)
-
-def calc_awesome(df):
-    return awesome_oscillator(high=df["high"], low=df["low"], window1=5, window2=34).shift(1).fillna(0)
-
-def calc_macd(df):
-    return MACD(close=df["close"], window_slow=26, window_fast=12, window_sign=9).macd_diff().shift(1).fillna(0)
-
-def calc_bb_upper(df):
-    return BollingerBands(close=df["close"], window=20, window_dev=2).bollinger_hband().shift(1).fillna(0)
-
-def calc_bb_lower(df):
-    return BollingerBands(close=df["close"], window=20, window_dev=2).bollinger_lband().shift(1).fillna(0)
-
-def calc_vwap(df):
-    return volume_weighted_average_price(high=df["high"], low=df["low"], close=df["close"], volume=df["volume"], window=14).shift(1).fillna(0)
-
-def calc_ema_10(df):
-    return EMAIndicator(close=df["close"], window=10).ema_indicator().shift(1).fillna(0)
-
-def calc_ema_20(df):
-    return EMAIndicator(close=df["close"], window=20).ema_indicator().shift(1).fillna(0)
-
-def calc_ema_50(df):
-    return EMAIndicator(close=df["close"], window=50).ema_indicator().shift(1).fillna(0)
-
-def calc_ema_200(df):
-    return EMAIndicator(close=df["close"], window=200).ema_indicator().shift(1).fillna(0)
-
-def calc_obv(df):
-    return OnBalanceVolumeIndicator(close=df["close"], volume=df["volume"]).on_balance_volume().shift(1).fillna(0)
-
-def calc_roc(df):
-    return ROCIndicator(close=df["close"], window=14).roc().shift(1).fillna(0)
-
-def calc_mfi(df):
-    return MFIIndicator(high=df["high"], low=df["low"], close=df["close"], volume=df["volume"], window=14).money_flow_index().shift(1).fillna(50)
-
-def calc_atr(df):
-    return AverageTrueRange(high=df["high"], low=df["low"], close=df["close"], window=5).average_true_range().shift(1).fillna(0)
-
+# 2. Thêm đặc trưng
 def add_features(df):
     logging.info("Bắt đầu thêm đặc trưng...")
     df = df.copy()
-    df["price_change"] = df["close"].pct_change().fillna(0)
     
-    df["rsi"] = calc_rsi(df)
-    df["adx"] = calc_adx(df)
-    df["adx_pos"] = calc_adx_pos(df)
-    df["adx_neg"] = calc_adx_neg(df)
-    df["stoch"] = calc_stoch(df)
-    df["momentum"] = calc_momentum(df)
-    df["awesome"] = calc_awesome(df)
-    df["macd"] = calc_macd(df)
-    df["bb_upper"] = calc_bb_upper(df)
-    df["bb_lower"] = calc_bb_lower(df)
-    df["vwap"] = calc_vwap(df)
-    df["ema_10"] = calc_ema_10(df)
-    df["ema_20"] = calc_ema_20(df)
-    df["ema_50"] = calc_ema_50(df)
-    df["ema_200"] = calc_ema_200(df)
-    df["obv"] = calc_obv(df)
-    df["roc"] = calc_roc(df)
-    df["mfi"] = calc_mfi(df)
-    df["atr"] = calc_atr(df)
+    if len(df) < 200:
+        logging.warning("Dữ liệu <200 bản ghi, EMA_200 có thể không chính xác.")
     
-    # Chuyển đổi cyclic features thành sine-cosine
+    df["price_change"] = df["close"].pct_change().shift(1).fillna(0)
+    df["rsi"] = RSIIndicator(close=df["close"], window=14).rsi().shift(1).fillna(50)
+    df["adx"] = ADXIndicator(high=df["high"], low=df["low"], close=df["close"], window=14).adx().shift(1).fillna(25)
+    df["adx_pos"] = ADXIndicator(high=df["high"], low=df["low"], close=df["close"], window=14).adx_pos().shift(1).fillna(0)
+    df["adx_neg"] = ADXIndicator(high=df["high"], low=df["low"], close=df["close"], window=14).adx_neg().shift(1).fillna(0)
+    df["stoch"] = StochasticOscillator(high=df["high"], low=df["low"], close=df["close"], window=14, smooth_window=3).stoch().shift(1).fillna(50)
+    df["momentum"] = df["close"].diff(5).shift(1).fillna(0)
+    df["awesome"] = awesome_oscillator(high=df["high"], low=df["low"], window1=5, window2=34).shift(1).fillna(0)
+    df["macd"] = MACD(close=df["close"], window_slow=26, window_fast=12, window_sign=9).macd_diff().shift(1).fillna(0)
+    df["bb_upper"] = BollingerBands(close=df["close"], window=20, window_dev=2).bollinger_hband().shift(1).fillna(0)
+    df["bb_lower"] = BollingerBands(close=df["close"], window=20, window_dev=2).bollinger_lband().shift(1).fillna(0)
+    df["vwap"] = volume_weighted_average_price(high=df["high"], low=df["low"], close=df["close"], volume=df["volume"], window=14).shift(1).fillna(0)
+    df["ema_10"] = EMAIndicator(close=df["close"], window=10).ema_indicator().shift(1).fillna(0)
+    df["ema_20"] = EMAIndicator(close=df["close"], window=20).ema_indicator().shift(1).fillna(0)
+    df["ema_50"] = EMAIndicator(close=df["close"], window=50).ema_indicator().shift(1).fillna(0)
+    df["ema_200"] = EMAIndicator(close=df["close"], window=200).ema_indicator().shift(1).fillna(0)
+    df["obv"] = OnBalanceVolumeIndicator(close=df["close"], volume=df["volume"]).on_balance_volume().shift(1).fillna(0)
+    df["roc"] = ROCIndicator(close=df["close"], window=14).roc().shift(1).fillna(0)
+    df["mfi"] = MFIIndicator(high=df["high"], low=df["low"], close=df["close"], volume=df["volume"], window=14).money_flow_index().shift(1).fillna(50)
+    df["atr"] = AverageTrueRange(high=df["high"], low=df["low"], close=df["close"], window=5).average_true_range().shift(1).fillna(0)
+    
     df["hour_sin"] = np.sin(2 * np.pi * df.index.hour / 24)
     df["hour_cos"] = np.cos(2 * np.pi * df.index.hour / 24)
     df["dayofweek_sin"] = np.sin(2 * np.pi * df.index.dayofweek / 7)
     df["dayofweek_cos"] = np.cos(2 * np.pi * df.index.dayofweek / 7)
     
-    df["vol_breakout"] = (df["high"] - df["low"]) / df["high"].shift(1).fillna(0)
+    df["vol_breakout"] = ((df["high"] - df["low"]) / df["high"].shift(1)).shift(1).fillna(0)
     df["vol_delta"] = df["obv"].diff().shift(1).fillna(0)
     df["rolling_mean_5"] = df["close"].rolling(window=5).mean().shift(1).fillna(0)
     df["rolling_std_5"] = df["close"].rolling(window=5).std().shift(1).fillna(0)
     df["lag_1"] = df["close"].shift(1).fillna(0)
     
+    df["rsi_macd_interaction"] = (df["rsi"] * df["macd"]).shift(1).fillna(0)
+    
     df = df.replace([np.inf, -np.inf], np.nan).ffill().bfill()
-    logging.info("Hoàn thành thêm đặc trưng.")
+    logging.info(f"Kích thước sau khi thêm đặc trưng: {df.shape}")
     return df
 
-# 3. Định nghĩa nhãn (Đã sửa để giữ ema_10 và atr)
-def define_target_new(df, horizon=5, atr_multiplier=0.1):
-    logging.info(f"Bắt đầu định nghĩa nhãn (horizon={horizon} giờ, atr_multiplier={atr_multiplier})...")
+# 3. Định nghĩa nhãn
+def define_target_new(df, horizon=5, atr_multiplier=0.1, long_threshold=0.001, short_threshold=-0.001):
+    logging.info(f"Định nghĩa nhãn: horizon={horizon}, atr_multiplier={atr_multiplier}, "
+                 f"long_threshold={long_threshold}, short_threshold={short_threshold}")
     df = df.copy()
     
-    df["ema_10"] = calc_ema_10(df)
-    df["atr"] = calc_atr(df)
-    
+    df["ema_10"] = EMAIndicator(close=df["close"], window=10).ema_indicator().shift(1).fillna(0)
+    df["atr"] = AverageTrueRange(high=df["high"], low=df["low"], close=df["close"], window=5).average_true_range().shift(1).fillna(0)
     df["future_return"] = df["close"].shift(-horizon) / df["close"] - 1
-    long_threshold = 0.001  # +0.1%
-    short_threshold = -0.001  # -0.1%
-    
     df["threshold"] = df["atr"] * atr_multiplier
     
-    df["target"] = 1  # Default là NEUTRAL
-    for i in range(len(df)):
-        curr_close = df["close"].iloc[i]
-        curr_ema_10 = df["ema_10"].iloc[i]
-        curr_threshold = df["threshold"].iloc[i]
-        curr_future_return = df["future_return"].iloc[i]
-        
-        if (curr_close > curr_ema_10 + curr_threshold and curr_future_return >= long_threshold):
-            df.iloc[i, df.columns.get_loc("target")] = 2  # LONG
-        elif (curr_close < curr_ema_10 - curr_threshold and curr_future_return <= short_threshold):
-            df.iloc[i, df.columns.get_loc("target")] = 0  # SHORT
+    df["target"] = 1  # NEUTRAL
+    long_condition = (df["close"] > df["ema_10"] + df["threshold"]) & (df["future_return"] >= long_threshold)
+    short_condition = (df["close"] < df["ema_10"] - df["threshold"]) & (df["future_return"] <= short_threshold)
     
-    # Chỉ xóa future_return và threshold để tránh leakage, giữ ema_10 và atr
-    df = df.drop(columns=["future_return", "threshold"], errors='ignore').dropna()
+    df.loc[long_condition, "target"] = 2  # LONG
+    df.loc[short_condition, "target"] = 0  # SHORT
     
-    # Kiểm tra phân phối nhãn
-    label_counts = df["target"].value_counts()
-    total_samples = len(df)
-    label_ratios = label_counts / total_samples
-    logging.info(f"Phân phối nhãn - Số lượng: {label_counts}")
-    logging.info(f"Phân phối nhãn - Tỷ lệ: {label_ratios}")
+    df = df.drop(columns=["threshold"], errors='ignore').dropna()
     
-    if label_ratios.get(2, 0) < 0.1 or label_ratios.get(0, 0) < 0.1:
-        logging.warning("Phân phối nhãn không cân bằng: Tỷ lệ LONG hoặc SHORT quá thấp (<10%).")
-    
+    label_ratios = df["target"].value_counts(normalize=True)
+    logging.info(f"Phân phối nhãn: {label_ratios}")
     return df
 
-# 4. Đánh giá chất lượng nhãn
-def evaluate_label_quality(df, horizon=5, transaction_cost=0.001):
-    logging.info(f"Đánh giá chất lượng nhãn (horizon={horizon} giờ, chi phí giao dịch={transaction_cost*100:.2f}%)...")
-    df = df.copy()
-    df["future_return"] = df["close"].shift(-horizon) / df["close"] - 1
-    df = df.dropna()
-    
-    long_returns = df[df["target"] == 2]["future_return"]
-    short_returns = df[df["target"] == 0]["future_return"]
-    neutral_returns = df[df["target"] == 1]["future_return"]
-    
-    long_returns_adj = long_returns - 2 * transaction_cost
-    short_returns_adj = -short_returns - 2 * transaction_cost
-    neutral_returns_adj = neutral_returns
-    
-    long_avg_return = long_returns_adj.mean() if not long_returns_adj.empty else 0
-    short_avg_return = short_returns_adj.mean() if not short_returns_adj.empty else 0
-    neutral_avg_return = neutral_returns_adj.mean() if not neutral_returns_adj.empty else 0
-    long_success_ratio = (long_returns_adj > 0).mean() if not long_returns_adj.empty else 0
-    short_success_ratio = (short_returns_adj > 0).mean() if not short_returns_adj.empty else 0
-    long_volatility = long_returns_adj.std() if not long_returns_adj.empty else 0
-    short_volatility = short_returns_adj.std() if not short_returns_adj.empty else 0
-    
-    long_sharpe = (long_avg_return / long_volatility) if long_volatility > 0 else 0
-    short_sharpe = (short_avg_return / short_volatility) if short_volatility > 0 else 0
-    
-    def calc_max_drawdown(returns):
-        cumulative = (1 + returns).cumprod()
-        peak = cumulative.cummax()
-        drawdown = (cumulative - peak) / peak
-        return drawdown.min() if not drawdown.empty else 0
-    
-    long_max_dd = calc_max_drawdown(long_returns_adj)
-    short_max_dd = calc_max_drawdown(short_returns_adj)
-    
-    df["ema_10"] = calc_ema_10(df)
-    df.loc[:, "trend"] = np.where(df["close"] > df["ema_10"], "UPTREND", 
-                                  np.where(df["close"] < df["ema_10"], "DOWNTREND", "NEUTRAL"))
-    long_uptrend_success = (df.loc[(df["target"] == 2) & (df["trend"] == "UPTREND"), "future_return"] - 2 * transaction_cost > 0).mean() if not df[(df["target"] == 2) & (df["trend"] == "UPTREND")].empty else 0
-    short_downtrend_success = (-df.loc[(df["target"] == 0) & (df["trend"] == "DOWNTREND"), "future_return"] - 2 * transaction_cost > 0).mean() if not df[(df["target"] == 0) & (df["trend"] == "DOWNTREND")].empty else 0
-    
-    label_counts = df["target"].value_counts()
-    total_samples = len(df)
-    label_ratios = label_counts / total_samples
-    
-    logging.info(f"Phân phối nhãn - Số lượng: {label_counts}")
-    logging.info(f"Phân phối nhãn - Tỷ lệ: {label_ratios}")
-    logging.info(f"Lợi nhuận trung bình (sau {horizon} giờ, đã trừ chi phí giao dịch):")
-    logging.info(f"LONG: {long_avg_return:.4f}, Tỷ lệ thành công: {long_success_ratio:.4f}, Độ biến động: {long_volatility:.4f}")
-    logging.info(f"SHORT: {short_avg_return:.4f}, Tỷ lệ thành công: {short_success_ratio:.4f}, Độ biến động: {short_volatility:.4f}")
-    logging.info(f"NEUTRAL: {neutral_avg_return:.4f}")
-    logging.info(f"Sharpe Ratio - LONG: {long_sharpe:.4f}, SHORT: {short_sharpe:.4f}")
-    logging.info(f"Max Drawdown - LONG: {long_max_dd:.4f}, SHORT: {short_max_dd:.4f}")
-    logging.info(f"Tỷ lệ thành công theo xu hướng - LONG trong UPTREND: {long_uptrend_success:.4f}, SHORT trong DOWNTREND: {short_downtrend_success:.4f}")
-    
-    evaluation = {
-        "label_distribution_ok": (0.20 <= label_ratios.get(2, 0) <= 0.25) and (0.20 <= label_ratios.get(0, 0) <= 0.25) and (0.50 <= label_ratios.get(1, 0) <= 0.60),
-        "long_profit_ok": long_avg_return > 0,
-        "short_profit_ok": short_avg_return > 0,
-        "long_success_ok": long_success_ratio >= 0.6,
-        "short_success_ok": short_success_ratio >= 0.6,
-        "long_trend_ok": long_uptrend_success >= 0.7,
-        "short_trend_ok": short_downtrend_success >= 0.7,
-        "volatility_ok": long_volatility <= 0.1 and short_volatility <= 0.1,
-        "sharpe_ok": long_sharpe >= 0.5 and short_sharpe >= 0,
-        "drawdown_ok": abs(long_max_dd) <= 0.2 and abs(short_max_dd) <= 0.2
-    }
-    
-    logging.info("\nĐánh giá tổng quan:")
-    for key, value in evaluation.items():
-        logging.info(f"{key}: {'OK' if value else 'NOT OK'}")
-    
-    return df, evaluation
-
-# 5. Chuẩn bị dữ liệu
+# 4. Chuẩn bị dữ liệu
 def prepare_data(df, features, timesteps, horizon):
-    logging.info("Bắt đầu chuẩn bị dữ liệu...")
+    logging.info("Chuẩn bị dữ liệu...")
     feature_data = df[features].values
-    
-    # Sử dụng sliding_window_view và sao chép để tránh non-contiguous array
     X = np.lib.stride_tricks.sliding_window_view(feature_data, (timesteps, len(features))).squeeze().copy()
-    y = df["target"].values[timesteps-1:].astype(int)  # Cast y về int
+    y = df["target"].values[timesteps-1:].astype(int)
     
-    if len(X) != len(y):
-        min_len = min(len(X), len(y))
-        X = X[:min_len]
-        y = y[:min_len]
+    logging.info(f"Kích thước X: {X.shape}, y: {len(y)}")
     
-    # Sử dụng TimeSeriesSplit với gap=horizon để tránh leakage
-    tscv = TimeSeriesSplit(n_splits=5, test_size=len(y)//10, gap=horizon)
-    for train_idx, val_idx in tscv.split(X):
-        X_train, X_val = X[train_idx], X[val_idx]
-        y_train, y_val = y[train_idx], y[val_idx]
-        break  # Lấy fold đầu tiên để huấn luyện ban đầu
-    
-    X_test = X[-len(y) // 10:]
-    y_test = y[-len(y) // 10:]
-    X_train = X_train[:-len(X_test)]
-    y_train = y_train[:-len(X_test)]
-    
-    # Fit scaler chỉ trên tập train
     scaler = RobustScaler()
-    X_train_2d = X_train.reshape(-1, X_train.shape[-1])
-    scaler.fit(X_train_2d)
-    X_train_scaled = scaler.transform(X_train_2d).reshape(X_train.shape)
-    X_val_scaled = scaler.transform(X_val.reshape(-1, X_val.shape[-1])).reshape(X_val.shape)
-    X_test_scaled = scaler.transform(X_test.reshape(-1, X_test.shape[-1])).reshape(X_test.shape)
+    X_2d = X.reshape(-1, X.shape[-1])
+    X_scaled = scaler.fit_transform(X_2d).reshape(X.shape)
     
-    logging.info(f"Phân phối nhãn ban đầu (train): {pd.Series(y_train).value_counts()}")
-    logging.info(f"Phân phối nhãn ban đầu (validation): {pd.Series(y_val).value_counts()}")
-    logging.info(f"Phân phối nhãn ban đầu (test): {pd.Series(y_test).value_counts()}")
-    logging.info(f"Kích thước dữ liệu: X_train={X_train_scaled.shape}, X_val={X_val_scaled.shape}, X_test={X_test_scaled.shape}")
-    return X_train_scaled, y_train, X_val_scaled, y_val, X_test_scaled, y_test, scaler
+    return X_scaled, y, scaler
 
-# 6. Xây dựng mô hình LSTM
-def build_lstm_model(input_shape, lstm_units=32, num_heads=8, dropout_rate=0.5):
+# 5. Xây dựng mô hình LSTM
+def build_lstm_model(input_shape, lstm_units=32, num_heads=8, dropout_rate=0.5, l2_lambda=0.01):
     inputs = Input(shape=input_shape)
-    lstm1 = Bidirectional(LSTM(lstm_units, return_sequences=True, kernel_regularizer=l2(0.01)))(inputs)
+    lstm1 = Bidirectional(LSTM(lstm_units // 2, return_sequences=True, kernel_regularizer=l2(l2_lambda)))(inputs)
     lstm1 = BatchNormalization()(lstm1)
     lstm1 = Dropout(dropout_rate)(lstm1)
     
-    lstm1_projected = Dense(input_shape[1], kernel_regularizer=l2(0.01))(lstm1)
+    lstm1_projected = Dense(input_shape[1], kernel_regularizer=l2(l2_lambda))(lstm1)
     residual1 = Add()([lstm1_projected, inputs])
     
-    lstm2 = Bidirectional(LSTM(lstm_units // 2, return_sequences=True, kernel_regularizer=l2(0.01)))(residual1)
+    lstm2 = Bidirectional(LSTM(lstm_units // 4, return_sequences=True, kernel_regularizer=l2(l2_lambda)))(residual1)
     lstm2 = BatchNormalization()(lstm2)
     lstm2 = Dropout(dropout_rate)(lstm2)
     
-    lstm2_projected = Dense(input_shape[1], kernel_regularizer=l2(0.01))(lstm2)
+    lstm2_projected = Dense(input_shape[1], kernel_regularizer=l2(l2_lambda))(lstm2)
     residual2 = Add()([lstm2_projected, residual1])
     
-    attention = MultiHeadAttention(num_heads=num_heads, key_dim=lstm_units // 2)(residual2, residual2)
+    attention = MultiHeadAttention(num_heads=num_heads, key_dim=lstm_units // 4)(residual2, residual2)
     attention = BatchNormalization()(attention)
     x = Add()([attention, residual2])
     x = GlobalAveragePooling1D()(x)
     
-    x = Dense(64, activation="relu", kernel_regularizer=l2(0.01))(x)
+    x = Dense(32, activation="relu", kernel_regularizer=l2(l2_lambda))(x)
     x = Dropout(dropout_rate)(x)
-    x = Dense(32, activation="relu", kernel_regularizer=l2(0.01))(x)
+    x = Dense(16, activation="relu", kernel_regularizer=l2(l2_lambda))(x)
     x = Dropout(dropout_rate)(x)
     outputs = Dense(3, activation="softmax")(x)
     
-    model = Model(inputs=inputs, outputs=outputs)
-    return model
+    return Model(inputs=inputs, outputs=outputs)
 
-# 7. Tối ưu hóa siêu tham số
+# 6. Tối ưu hóa siêu tham số
 def objective(trial):
     try:
-        # Ghi log bắt đầu trial
         logging.info(f"Starting Trial {trial.number}")
         
-        # Lấy các siêu tham số
-        timesteps = trial.suggest_int("timesteps", 10, 50)
+        timesteps = trial.suggest_int("timesteps", 10, 30)
         horizon = trial.suggest_int("horizon", 2, 5)
-        lstm_units = trial.suggest_int("lstm_units", 16, 128)
-        num_heads = trial.suggest_int("num_heads", 4, 16)
-        dropout_rate = trial.suggest_float("dropout_rate", 0.3, 0.7)
+        lstm_units = trial.suggest_int("lstm_units", 16, 64)
+        num_heads = trial.suggest_int("num_heads", 4, 12)
+        dropout_rate = trial.suggest_float("dropout_rate", 0.4, 0.8)
         learning_rate = trial.suggest_float("learning_rate", 1e-4, 1e-2, log=True)
         gamma = trial.suggest_float("gamma", 4.5, 6.0)
+        atr_multiplier = trial.suggest_float("atr_multiplier", 0.2, 0.5)
+        long_threshold = trial.suggest_float("long_threshold", 0.0005, 0.005)
+        short_threshold = -trial.suggest_float("short_threshold", 0.0005, 0.005)
+        l2_lambda = trial.suggest_float("l2_lambda", 0.01, 0.1)
+        
         alpha = [trial.suggest_float("alpha_0", 0.6, 0.8),
-                 trial.suggest_float("alpha_1", 0.0, 0.2),
+                 trial.suggest_float("alpha_1", 0.1, 0.3),
                  trial.suggest_float("alpha_2", 0.6, 0.8)]
-        atr_multiplier = trial.suggest_float("atr_multiplier", 0.05, 0.5)
         
-        # Ghi log các siêu tham số
-        logging.info(f"Trial {trial.number} Params: timesteps={timesteps}, horizon={horizon}, lstm_units={lstm_units}, "
-                     f"num_heads={num_heads}, dropout_rate={dropout_rate:.4f}, learning_rate={learning_rate:.6f}, "
-                     f"gamma={gamma:.4f}, alpha={alpha}, atr_multiplier={atr_multiplier:.4f}")
-
-        # Chuẩn bị dữ liệu
-        df_trial = define_target_new(df.copy(), horizon=horizon, atr_multiplier=atr_multiplier)
-        X_train, y_train, X_val, y_val, _, _, _ = prepare_data(df_trial, features, timesteps, horizon)
-        if X_train.shape[0] == 0 or X_val.shape[0] == 0:
-            raise ValueError("Dữ liệu rỗng sau khi xử lý!")
+        logging.info(f"Trial {trial.number} Params: timesteps={timesteps}, horizon={horizon}, "
+                     f"lstm_units={lstm_units}, num_heads={num_heads}, dropout_rate={dropout_rate:.4f}, "
+                     f"learning_rate={learning_rate:.6f}, gamma={gamma:.4f}, alpha={alpha}, "
+                     f"atr_multiplier={atr_multiplier:.4f}, long_threshold={long_threshold:.4f}, "
+                     f"short_threshold={short_threshold:.4f}, l2_lambda={l2_lambda:.4f}")
         
-        # Xây dựng và huấn luyện mô hình
-        lstm_model = build_lstm_model((timesteps, len(features)), lstm_units, num_heads, dropout_rate)
-        lstm_model.compile(optimizer=AdamW(learning_rate=learning_rate, weight_decay=1e-4), 
-                          loss=focal_loss(gamma=gamma, alpha=alpha), metrics=["accuracy"])
+        df_trial = define_target_new(df.copy(), horizon=horizon, atr_multiplier=atr_multiplier,
+                                     long_threshold=long_threshold, short_threshold=short_threshold)
+        X_scaled, y, scaler = prepare_data(df_trial, features, timesteps, horizon)
         
-        callbacks = [EarlyStopping(patience=15, restore_best_weights=True), ReduceLROnPlateau(factor=0.5, patience=5)]
+        val_size = int(len(y) * 0.2)
+        X_train, X_val = X_scaled[:-val_size], X_scaled[-val_size:]
+        y_train, y_val = y[:-val_size], y[-val_size:]
+        
+        lstm_model = build_lstm_model((timesteps, len(features)), lstm_units, num_heads, dropout_rate, l2_lambda)
+        lstm_model.compile(optimizer=AdamW(learning_rate=learning_rate, weight_decay=1e-4),
+                           loss=focal_loss(gamma=gamma, alpha=alpha),
+                           metrics=["accuracy"])
+        
+        callbacks = [EarlyStopping(patience=15, restore_best_weights=True),
+                     ReduceLROnPlateau(factor=0.5, patience=5)]
+        
         class_weight = {0: 10.0, 1: 1.0, 2: 10.0}
-        lstm_model.fit(X_train, y_train, validation_data=(X_val, y_val), epochs=50, batch_size=64, 
+        
+        logging.info(f"Trial {trial.number} - Starting model training...")
+        lstm_model.fit(X_train, y_train, validation_data=(X_val, y_val), epochs=30, batch_size=64,
                        callbacks=callbacks, class_weight=class_weight, verbose=0)
         
-        # Dự đoán và tính F1-score
+        logging.info(f"Trial {trial.number} - Predicting on validation set...")
         lstm_val_pred = lstm_model.predict(X_val, verbose=0)
         y_pred = np.argmax(lstm_val_pred, axis=1)
         f1 = f1_score(y_val, y_pred, average="weighted")
         
-        # Ghi log kết quả
-        logging.info(f"Trial {trial.number} completed successfully with F1-score: {f1:.4f}")
-        return f1
+        df_val = df_trial.iloc[-len(y_val):].copy()
+        df_val["pred"] = y_pred
+        returns = df_val["future_return"]
+        profit = np.where(y_pred == 2, returns, np.where(y_pred == 0, -returns, 0)).mean()
+        
+        logging.info(f"Trial {trial.number} F1-score: {f1:.4f}, Profit: {profit:.4f}")
+        objective_value = f1 + profit
+        
+        if not np.isfinite(objective_value):
+            raise ValueError("Objective value is not finite")
+        
+        return objective_value
+    
     except Exception as e:
-        # Ghi log lỗi nếu trial thất bại
         logging.error(f"Trial {trial.number} failed with error: {str(e)}")
         return -1
 
-# 8. Huấn luyện và đánh giá
+# 7. Huấn luyện và đánh giá
 def train_and_evaluate(X, y, best_params, features, timesteps, horizon):
-    logging.info("Bắt đầu huấn luyện và đánh giá mô hình cuối cùng...")
+    logging.info("Huấn luyện và đánh giá với Walk-Forward Validation động...")
     
-    tscv = TimeSeriesSplit(n_splits=5, test_size=len(y)//10, gap=horizon)
+    window_size = int(len(y) * 0.2)
+    step_size = int(len(y) * 0.1)
+    n_steps = min(5, (len(y) - window_size) // step_size + 1)
+    
     f1_scores = []
-    roc_aucs = []
-    
-    # Fit scaler trên toàn bộ train set sau tuning
-    scaler = RobustScaler()
-    X_2d = X.reshape(-1, X.shape[-1])
-    scaler.fit(X_2d)
-    X_scaled = scaler.transform(X_2d).reshape(X.shape)
-    
-    for fold, (train_idx, test_idx) in enumerate(tscv.split(X_scaled)):
-        logging.info(f"Fold {fold + 1}/5")
-        X_train, X_test = X_scaled[train_idx], X_scaled[test_idx]
-        y_train, y_test = y[train_idx], y[test_idx]
+    for i in range(n_steps):
+        start = i * step_size
+        end = start + window_size
+        train_end = int(start + window_size * 0.7)
         
-        lstm_model = build_lstm_model((timesteps, len(features)), best_params["lstm_units"], best_params["num_heads"], best_params["dropout_rate"])
-        lstm_model.compile(optimizer=AdamW(learning_rate=best_params["learning_rate"], weight_decay=1e-4), 
-                           loss=focal_loss(gamma=best_params["gamma"], alpha=[best_params["alpha_0"], best_params["alpha_1"], best_params["alpha_2"]]), 
+        X_train, X_test = X[:train_end], X[start:end]
+        y_train, y_test = y[:train_end], y[start:end]
+        
+        logging.info(f"Step {i+1}/{n_steps}: Train {len(X_train)}, Test {len(X_test)}")
+        
+        lstm_model = build_lstm_model((timesteps, len(features)), 
+                                     best_params["lstm_units"], 
+                                     best_params["num_heads"], 
+                                     best_params["dropout_rate"],
+                                     best_params["l2_lambda"])
+        lstm_model.compile(optimizer=AdamW(learning_rate=best_params["learning_rate"], weight_decay=1e-4),
+                           loss=focal_loss(gamma=best_params["gamma"], 
+                                          alpha=[best_params["alpha_0"], best_params["alpha_1"], best_params["alpha_2"]]),
                            metrics=["accuracy"])
         
-        callbacks = [EarlyStopping(patience=15, restore_best_weights=True), ReduceLROnPlateau(factor=0.5, patience=5)]
+        callbacks = [EarlyStopping(patience=15, restore_best_weights=True),
+                     ReduceLROnPlateau(factor=0.5, patience=5)]
         
-        # Điều chỉnh class_weight dựa trên phân phối nhãn
         label_counts = pd.Series(y_train).value_counts()
         total_samples = len(y_train)
-        class_weight = {0: total_samples / (3 * label_counts.get(0, 1)),  # SHORT
-                        1: total_samples / (3 * label_counts.get(1, 1)),  # NEUTRAL
-                        2: total_samples / (3 * label_counts.get(2, 1))}  # LONG
-        logging.info(f"Class Weights: Using Focal Loss with gamma={best_params['gamma']}, alpha={[best_params['alpha_0'], best_params['alpha_1'], best_params['alpha_2']]}, class_weight={class_weight}")
+        class_weight = {0: total_samples / (3 * label_counts.get(0, 1)),
+                        1: total_samples / (3 * label_counts.get(1, 1)),
+                        2: total_samples / (3 * label_counts.get(2, 1))}
         
-        history = lstm_model.fit(
-            X_train, y_train,
-            validation_data=(X_test, y_test),
-            epochs=50,
-            batch_size=64,
-            callbacks=callbacks,
-            class_weight=class_weight,
-            verbose=1
-        )
+        lstm_model.fit(X_train, y_train, validation_data=(X_test, y_test), epochs=50, batch_size=64,
+                       callbacks=callbacks, class_weight=class_weight, verbose=1)
         
-        # Monte Carlo Dropout cho meta-labeling
-        num_mc_samples = 50
-        predictions = np.zeros((len(y_test), 3))
-        for _ in range(num_mc_samples):
-            preds = lstm_model.predict(X_test, verbose=0)
-            predictions += preds / num_mc_samples
-        y_pred_mc = np.argmax(predictions, axis=1)
-        
-        # Thêm SHAP values để giải thích dự đoán
-        # explainer = shap.DeepExplainer(lstm_model, X_train[:100])
-        # shap_values = explainer.shap_values(X_test[:50])
-        # shap.summary_plot(shap_values, X_test[:50], feature_names=features, plot_type="bar", show=False)
-        # plt.savefig(f"shap_summary_fold_{fold + 1}.png")
-        # plt.close()
-        
-        # Báo cáo phân loại
-        report = classification_report(y_test, y_pred_mc, target_names=["SHORT", "NEUTRAL", "LONG"], zero_division=1)
-        logging.info(f"Fold {fold + 1} Classification Report (Monte Carlo):\n{report}")
-        
-        # Ma trận nhầm lẫn
-        cm = confusion_matrix(y_test, y_pred_mc)
-        plt.imshow(cm, cmap="Blues")
-        plt.title(f"Confusion Matrix - Fold {fold + 1}")
-        plt.colorbar()
-        plt.xticks([0, 1, 2], ["SHORT", "NEUTRAL", "LONG"])
-        plt.yticks([0, 1, 2], ["SHORT", "NEUTRAL", "LONG"])
-        for i in range(3):
-            for j in range(3):
-                plt.text(j, i, cm[i, j], ha="center", va="center", color="black")
-        plt.savefig(f"confusion_matrix_fold_{fold + 1}.png")
-        plt.close()
-        
-        # Precision-Recall Curve
-        precision = dict()
-        recall = dict()
-        y_test_one_hot = tf.keras.utils.to_categorical(y_test, num_classes=3)
-        for i in range(3):
-            precision[i], recall[i], _ = precision_recall_curve(y_test_one_hot[:, i], predictions[:, i])
-            plt.plot(recall[i], precision[i], label=f'Class {i} (SHORT=0, NEUTRAL=1, LONG=2)')
-        plt.xlabel('Recall')
-        plt.ylabel('Precision')
-        plt.title(f'Precision-Recall Curve - Fold {fold + 1}')
-        plt.legend()
-        plt.savefig(f"precision_recall_curve_fold_{fold + 1}.png")
-        plt.close()
-        
-        # ROC-AUC
-        roc_auc = dict()
-        fpr = dict()
-        tpr = dict()
-        for i in range(3):
-            fpr[i], tpr[i], _ = roc_curve(y_test_one_hot[:, i], predictions[:, i])
-            roc_auc[i] = roc_auc_score(y_test_one_hot[:, i], predictions[:, i])
-            logging.info(f"Fold {fold + 1} ROC-AUC for class {i}: {roc_auc[i]:.3f}")
-        
-        plt.figure()
-        for i in range(3):
-            plt.plot(fpr[i], tpr[i], label=f'Class {i} (ROC-AUC = {roc_auc[i]:.3f})')
-        plt.plot([0, 1], [0, 1], 'k--')
-        plt.xlabel('False Positive Rate')
-        plt.ylabel('True Positive Rate')
-        plt.title(f'ROC Curve - Fold {fold + 1}')
-        plt.legend()
-        plt.savefig(f"roc_curve_fold_{fold + 1}.png")
-        plt.close()
-        
-        # Lưu F1-score và ROC-AUC
-        f1 = f1_score(y_test, y_pred_mc, average="weighted")
+        lstm_test_pred = lstm_model.predict(X_test, verbose=0)
+        y_pred = np.argmax(lstm_test_pred, axis=1)
+        f1 = f1_score(y_test, y_pred, average="weighted")
         f1_scores.append(f1)
-        roc_aucs.append(np.mean(list(roc_auc.values())))
         
-        # Lưu lịch sử huấn luyện
-        plt.figure(figsize=(12, 4))
-        plt.subplot(1, 2, 1)
-        plt.plot(history.history["loss"], label="Training Loss")
-        plt.plot(history.history["val_loss"], label="Validation Loss")
-        plt.title(f"Model Loss - Fold {fold + 1}")
-        plt.xlabel("Epoch")
-        plt.ylabel("Loss")
-        plt.legend()
-        plt.subplot(1, 2, 2)
-        plt.plot(history.history["accuracy"], label="Training Accuracy")
-        plt.plot(history.history["val_accuracy"], label="Validation Accuracy")
-        plt.title(f"Model Accuracy - Fold {fold + 1}")
-        plt.xlabel("Epoch")
-        plt.ylabel("Accuracy")
-        plt.legend()
-        plt.savefig(f"training_history_fold_{fold + 1}.png")
-        plt.close()
+        logging.info(f"Step {i+1} F1-score: {f1:.4f}")
     
-    logging.info(f"Average F1-score across folds: {np.mean(f1_scores):.3f} ± {np.std(f1_scores):.3f}")
-    logging.info(f"Average ROC-AUC across folds: {np.mean(roc_aucs):.3f} ± {np.std(roc_aucs):.3f}")
-    return lstm_model, scaler
+    avg_f1 = np.mean(f1_scores)
+    logging.info(f"Average F1-score: {avg_f1:.3f} ± {np.std(f1_scores):.3f}")
+    return lstm_model, scaler, avg_f1
 
-# 9. Pipeline chính
+# 8. Pipeline chính
 if __name__ == "__main__":
     try:
         df = load_data()
         df = add_features(df)
         
         features = ["price_change", "rsi", "adx", "adx_pos", "adx_neg", "stoch", "momentum", "awesome", 
-                    "macd", "bb_upper", "bb_lower", "vwap", "ema_10", "ema_20", "ema_50", "ema_200", "obv", 
-                    "roc", "mfi", "vol_breakout", "vol_delta", "rolling_mean_5", "rolling_std_5", 
-                    "lag_1", "hour_sin", "hour_cos", "dayofweek_sin", "dayofweek_cos", "atr"]
-        
-        # Đánh giá nhãn trước khi tối ưu hóa
-        df_labeled = define_target_new(df, horizon=5, atr_multiplier=0.1)
-        df_evaluated, evaluation = evaluate_label_quality(df_labeled, horizon=5)
+                    "macd", "bb_upper", "bb_lower", "vwap", "ema_10", "ema_20", "ema_50", "ema_200", 
+                    "obv", "roc", "mfi", "vol_breakout", "vol_delta", "rolling_mean_5", "rolling_std_5", 
+                    "lag_1", "hour_sin", "hour_cos", "dayofweek_sin", "dayofweek_cos", "atr", 
+                    "rsi_macd_interaction"]
         
         # Tối ưu hóa siêu tham số
-        study = optuna.create_study(direction="maximize", sampler=TPESampler(n_startup_trials=20, multivariate=True, seed=42))
-        study.optimize(objective, n_trials=100)
+        study = optuna.create_study(direction="maximize", sampler=TPESampler(n_startup_trials=20, seed=42))
+        study.optimize(objective, n_trials=10, n_jobs=2)  # Sử dụng 2 luồng CPU
         
-        # Ghi log chi tiết trial tốt nhất
         best_trial = study.best_trial
-        logging.info(f"Best Trial: {best_trial.number}")
+        logging.info(f"Best Trial: {best_trial.number}, Value: {best_trial.value:.4f}")
         logging.info(f"Best Params: {best_trial.params}")
-        logging.info(f"Best F1-score: {best_trial.value:.4f}")
         
-        # Lưu toàn bộ trials vào CSV
         trials_df = study.trials_dataframe()
         trials_df.to_csv("optuna_trials_log.csv", index=False)
-        logging.info("Saved all Optuna trials to 'optuna_trials_log.csv'")
         
+        # Kiểm tra kết quả tối ưu hóa
+        if best_trial.value <= 0:
+            logging.error(f"Optimization failed: Best value {best_trial.value} is not positive.")
+            raise ValueError("Optimization did not yield a valid positive objective value")
+        
+        # Huấn luyện và đánh giá với tham số tốt nhất
         best_params = study.best_params
-        logging.info(f"Tham số tối ưu: Horizon = {best_params['horizon']}, Timesteps = {best_params['timesteps']}")
+        df_final = define_target_new(df, horizon=best_params["horizon"], 
+                                    atr_multiplier=best_params["atr_multiplier"],
+                                    long_threshold=best_params["long_threshold"],
+                                    short_threshold=best_params["short_threshold"])
+        X_scaled, y, scaler = prepare_data(df_final, features, best_params["timesteps"], best_params["horizon"])
         
-        # Chuẩn bị dữ liệu toàn bộ để backtesting với tham số tốt nhất
-        timesteps = best_params["timesteps"]
-        horizon = best_params["horizon"]
-        atr_multiplier = best_params["atr_multiplier"]
-        df = define_target_new(df, horizon=horizon, atr_multiplier=atr_multiplier)
+        lstm_model, scaler, avg_f1 = train_and_evaluate(X_scaled, y, best_params, features, 
+                                                       best_params["timesteps"], best_params["horizon"])
         
-        feature_data = df[features].values
-        X = np.lib.stride_tricks.sliding_window_view(feature_data, (timesteps, len(features))).squeeze().copy()
-        y = df["target"].values[timesteps-1:].astype(int)
-        
-        if len(X) != len(y):
-            min_len = min(len(X), len(y))
-            X = X[:min_len]
-            y = y[:min_len]
-        
-        lstm_model, scaler = train_and_evaluate(X, y, best_params, features, timesteps, horizon)
-        
-        lstm_model.save("lstm_model.keras")
-        np.save("scaler.npy", scaler)
-        logging.info("Model and scaler saved successfully.")
+        # Chỉ lưu mô hình nếu tất cả hoàn thành và hiệu suất đạt yêu cầu
+        if avg_f1 > 0.5:  # Ngưỡng F1-score, có thể điều chỉnh
+            lstm_model.save("lstm_model.h5")
+            np.save("scaler.npy", scaler)
+            logging.info("Pipeline completed successfully. Model and scaler saved.")
+        else:
+            logging.warning(f"Pipeline completed but Average F1-score {avg_f1:.3f} is too low. Model not saved.")
+    
     except Exception as e:
-        logging.error(f"Error in main pipeline: {str(e)}")
+        logging.error(f"Error in pipeline: {str(e)}")
         raise

@@ -4,9 +4,9 @@ import time
 
 # Thông số
 symbol = "BTCUSDT"
-interval = "5m"
-start_time = int(time.mktime(time.strptime("2024-09-01 00:00:00", "%Y-%m-%d %H:%M:%S"))) * 1000  # 01/05/2021
-end_time = int(time.mktime(time.strptime("2025-03-19 00:00:00", "%Y-%m-%d %H:%M:%S"))) * 1000    # 01/05/2022
+interval = "1h"
+start_time = int(time.mktime(time.strptime("2020-01-01 00:00:00", "%Y-%m-%d %H:%M:%S"))) * 1000  # 01/05/2021
+end_time = int(time.mktime(time.strptime("2025-03-20 00:00:00", "%Y-%m-%d %H:%M:%S"))) * 1000    # 01/05/2022
 limit = 1000  # Giới hạn tối đa 1 request
 
 # Hàm lấy dữ liệu
