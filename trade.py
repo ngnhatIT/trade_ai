@@ -216,14 +216,14 @@ def optimize_signal_thresholds(df, param_grid):
         
         signals = pd.DataFrame(index=df.index)
         signals['signal'] = None
-        signals.loc[(df['prob_positive'] > prob_threshold) & 
+        signals.loc[(df['prob_positive'].fillna(0) > prob_threshold) & 
                     (df['ema_5'] > df['ema_10']) & 
                     (df['macd_diff'] > 0) & 
                     (df['rsi'] > rsi_lower) & (df['rsi'] < rsi_upper) & 
                     (df['stoch_k'] > df['stoch_d']) & 
                     (df['adx'] > adx_threshold) & 
                     (df['roc'] > 0), 'signal'] = 'LONG'
-        signals.loc[(df['prob_negative'] > prob_threshold) & 
+        signals.loc[(df['prob_negative'].fillna(0) > prob_threshold) & 
                     (df['ema_5'] < df['ema_10']) & 
                     (df['macd_diff'] < 0) & 
                     (df['rsi'] > rsi_lower) & (df['rsi'] < rsi_upper) & 
@@ -462,10 +462,6 @@ def predict_with_finbert(df, data_manager, model, tokenizer, device, batch_size=
         predict_with_finbert.no_data_count += 1
         if predict_with_finbert.no_data_count % 5 == 0:
             logging.info(f"No new data to predict with FinBERT, Total no-data counts: {predict_with_finbert.no_data_count}")
-        # If no new data to predict, fill NaN with 0 to avoid issues in signal generation
-        df['prob_positive'] = df['prob_positive'].fillna(0)
-        df['prob_negative'] = df['prob_negative'].fillna(0)
-        df['prob_neutral'] = df['prob_neutral'].fillna(0)
     else:
         try:
             texts = to_predict['text'].tolist()
@@ -506,12 +502,11 @@ def predict_with_finbert(df, data_manager, model, tokenizer, device, batch_size=
             df['prob_negative'] = df['prob_negative'].fillna(0)
             df['prob_neutral'] = df['prob_neutral'].fillna(0)
 
-    # Validate prob_positive before signal generation
-    if 'prob_positive' not in df.columns or df['prob_positive'].isna().all():
-        logging.error("prob_positive column is missing or all NaN after prediction, setting to 0")
-        df['prob_positive'] = 0
-        df['prob_negative'] = 0
-        df['prob_neutral'] = 0
+    # Ensure no NaN values in probability columns before signal generation
+    df['prob_positive'] = df['prob_positive'].fillna(0)
+    df['prob_negative'] = df['prob_negative'].fillna(0)
+    df['prob_neutral'] = df['prob_neutral'].fillna(0)
+    logging.info(f"prob_positive stats: min={df['prob_positive'].min()}, max={df['prob_positive'].max()}, mean={df['prob_positive'].mean()}")
 
     # Initialize signal column
     df['signal'] = None
@@ -528,8 +523,8 @@ def predict_with_finbert(df, data_manager, model, tokenizer, device, batch_size=
         # Tích hợp tâm lý thị trường
         sentiment_condition = data_manager.sentiment_score > 0.1
         
-        # Generate signals
-        df.loc[(df['prob_positive'] > prob_threshold) & 
+        # Generate signals with NaN handling
+        df.loc[(df['prob_positive'].fillna(0) > prob_threshold) & 
                (df['ema_5'] > df['ema_10']) & 
                (df['macd_diff'] > 0) & 
                (df['rsi'] > rsi_lower) & (df['rsi'] < rsi_upper) & 
@@ -540,7 +535,7 @@ def predict_with_finbert(df, data_manager, model, tokenizer, device, batch_size=
                (trend_4h) & 
                (sentiment_condition), 'signal'] = 'LONG'
         
-        df.loc[(df['prob_negative'] > prob_threshold) & 
+        df.loc[(df['prob_negative'].fillna(0) > prob_threshold) & 
                (df['ema_5'] < df['ema_10']) & 
                (df['macd_diff'] < 0) & 
                (df['rsi'] > rsi_lower) & (df['rsi'] < rsi_upper) & 
@@ -561,8 +556,9 @@ def predict_with_finbert(df, data_manager, model, tokenizer, device, batch_size=
         latest_atr = df['atr'].iloc[-1] if 'atr' in df.columns else 0
         current_price = data_manager.current_price
         if current_price is None:
-            logging.warning("Current price is None, cannot calculate TP/SL")
-            return df
+            # Fallback to last close price if current_price is None
+            current_price = df['close'].iloc[-1] if not df.empty and 'close' in df.columns else 0
+            logging.warning(f"Current price is None, using last close price: {current_price}")
 
         for idx in df.index:
             signal = df.at[idx, 'signal']
@@ -631,6 +627,21 @@ def process_and_predict(exchange, symbol, data_manager, model, tokenizer, device
     while True:
         start_time = time.time()
         
+        # Lấy giá real-time trước khi xử lý dữ liệu
+        try:
+            ticker = exchange.fetch_ticker(symbol)
+            current_price = ticker['last']
+            data_manager.update_current_price(current_price)
+        except Exception as e:
+            logging.error(f"Error fetching ticker: {e}")
+            # Fallback to last close price if available
+            if not data_manager.df_5m.empty and 'close' in data_manager.df_5m.columns:
+                data_manager.update_current_price(data_manager.df_5m['close'].iloc[-1])
+                logging.warning(f"Using last close price as fallback: {data_manager.current_price}")
+            else:
+                time.sleep(update_interval)
+                continue
+        
         # Cập nhật dữ liệu OHLCV
         data_updated = False
         if time.time() - last_ohlcv_update >= ohlcv_update_interval:
@@ -683,16 +694,6 @@ def process_and_predict(exchange, symbol, data_manager, model, tokenizer, device
 
         if data_manager.df_5m.empty:
             logging.warning("DataFrame 5m is empty, cannot process data")
-            time.sleep(update_interval)
-            continue
-        
-        # Lấy giá real-time
-        try:
-            ticker = exchange.fetch_ticker(symbol)
-            current_price = ticker['last']
-            data_manager.update_current_price(current_price)
-        except Exception as e:
-            logging.error(f"Error fetching ticker: {e}")
             time.sleep(update_interval)
             continue
         
@@ -813,6 +814,21 @@ if __name__ == "__main__":
     except Exception as e:
         logging.error(f"Error fetching initial data: {e}")
         exit(1)
+    
+    # Fetch initial current price before preprocessing
+    try:
+        ticker = exchange.fetch_ticker(symbol)
+        current_price = ticker['last']
+        data_manager.update_current_price(current_price)
+    except Exception as e:
+        logging.error(f"Error fetching initial ticker: {e}")
+        # Fallback to last close price if available
+        if not data_manager.df_5m.empty and 'close' in data_manager.df_5m.columns:
+            data_manager.update_current_price(data_manager.df_5m['close'].iloc[-1])
+            logging.warning(f"Using last close price as initial current price: {data_manager.current_price}")
+        else:
+            logging.error("No fallback price available. Exiting.")
+            exit(1)
     
     try:
         data_manager.df_5m = preprocess_data(data_manager.df_5m, data_manager)
