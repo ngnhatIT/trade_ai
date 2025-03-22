@@ -14,16 +14,11 @@ import logging
 import os
 from pathlib import Path
 import requests
-import tweepy
 import signal
 import sys
 from sklearn.model_selection import ParameterGrid
 import gc
-
-
-TELEGRAM_BOT_TOKEN = "7617216154:AAF-5RxHYmn63pC2BgGJTAMRm2ehO4HcZvA"
-TELEGRAM_CHAT_ID = "2028475238"
-BEARER_TOKEN = "AAAAAAAAAAAAAAAAAAAAAOlk0AEAAAAAgo9o2yJTC8k80o%2FYuxSSjvCmO8s%3DCWONLfMWOYGpRDRbv01pBZxmPltuIoTneXhVYJ55yhFHN69wzU"
+import psutil
 
 # Cấu hình logging
 logging.basicConfig(
@@ -35,25 +30,9 @@ logging.basicConfig(
     ]
 )
 
-# X API rate limit constants
-MONTHLY_TWEET_LIMIT = 10000
-RATE_LIMIT_THRESHOLD = 10
-TWEET_READ_LOG_FILE = "tweet_read_log.csv"
-TWEET_READ_COUNT = 0
-rate_limit_info = {
-    "limit": 900,
-    "remaining": 900,
-    "reset": int(time.time()) + 900
-}
-last_fetched_hour = -1
-
-# Initialize X API client
-try:
-    client = tweepy.Client(bearer_token=BEARER_TOKEN)
-    logging.info("Initialized X API client successfully")
-except Exception as e:
-    logging.error(f"Error initializing X API client: {e}")
-    client = None
+# Thông tin API
+TELEGRAM_BOT_TOKEN = "7617216154:AAF-5RxHYmn63pC2BgGJTAMRm2ehO4HcZvA"
+TELEGRAM_CHAT_ID = "2028475238"
 
 # Xử lý tín hiệu dừng
 def signal_handler(sig, frame):
@@ -89,12 +68,6 @@ def check_system_resources():
     if cpu_percent > 90:
         logging.warning("High CPU usage detected! Performance may be impacted.")
 
-# Hàm kiểm tra xem có nên lấy dữ liệu tâm lý không
-def should_fetch_sentiment_data():
-    current_hour = datetime.utcnow().hour
-    sensitive_hours = [8, 12, 16]
-    return current_hour != last_fetched_hour and (current_hour in sensitive_hours or True)
-
 # Class quản lý dữ liệu
 class DataManager:
     def __init__(self):
@@ -114,7 +87,6 @@ class DataManager:
         self.predictions_log = []
         self.anomaly_detector = IsolationForest(contamination=0.05, random_state=42)
         self.feature_weights = None
-        self.sentiment_score = 0.0
         self.signal_thresholds = {
             'prob_threshold': 0.4,
             'rsi_lower': 30,
@@ -295,81 +267,6 @@ def fetch_ohlcv_data(exchange, symbol, timeframe, hours_back, data_manager, limi
     except Exception as e:
         logging.error(f"Error fetching {timeframe} data: {e}")
         return pd.DataFrame()
-
-# Lấy dữ liệu tâm lý thị trường từ X
-def fetch_sentiment_data(data_manager, model, tokenizer, device):
-    global TWEET_READ_COUNT, rate_limit_info, last_fetched_hour
-    
-    try:
-        if TWEET_READ_COUNT >= MONTHLY_TWEET_LIMIT:
-            logging.warning("Reached monthly tweet read limit (10,000). Pausing sentiment data fetching.")
-            data_manager.sentiment_score = 0.0
-            return
-
-        if rate_limit_info["remaining"] <= RATE_LIMIT_THRESHOLD:
-            wait_time = max(0, rate_limit_info["reset"] - int(time.time()))
-            if wait_time > 0:
-                logging.info(f"Rate limit nearly reached. Waiting for {wait_time} seconds until reset.")
-                time.sleep(wait_time)
-
-        query = "Bitcoin OR BTC -is:retweet lang:en"
-        max_retries = 3
-        retry_delay = 1
-
-        for attempt in range(max_retries):
-            try:
-                response = client.search_recent_tweets(
-                    query=query,
-                    max_results=100,
-                    tweet_fields=["created_at", "lang", "public_metrics"],
-                    user_fields=["public_metrics"]
-                )
-
-                rate_limit_info["limit"] = int(response.headers.get("x-rate-limit-limit", 900))
-                rate_limit_info["remaining"] = int(response.headers.get("x-rate-limit-remaining", 0))
-                rate_limit_info["reset"] = int(response.headers.get("x-rate-limit-reset", int(time.time()) + 900))
-
-                tweets = [
-                    tweet.text for tweet in response.data
-                    if tweet.public_metrics['like_count'] > 50 or tweet.public_metrics['retweet_count'] > 20
-                ] if response.data else []
-                num_tweets = len(tweets)
-                TWEET_READ_COUNT += num_tweets
-
-                with open(TWEET_READ_LOG_FILE, "a") as f:
-                    f.write(f"{datetime.now()},{num_tweets}\n")
-
-                if not tweets:
-                    logging.warning("No tweets found for sentiment analysis.")
-                    data_manager.sentiment_score = 0.0
-                    return
-
-                inputs = tokenizer(tweets, return_tensors="pt", truncation=True, padding=True, max_length=512).to(device)
-                with torch.no_grad():
-                    outputs = model(**inputs)
-                    probs = torch.softmax(outputs.logits, dim=-1).cpu().numpy()
-                sentiment_score = np.mean(probs[:, 2] - probs[:, 0])
-                data_manager.sentiment_score = sentiment_score
-                logging.info(f"Updated sentiment score: {sentiment_score:.4f} (based on {num_tweets} tweets)")
-                break
-
-            except tweepy.errors.TooManyRequests as e:
-                wait_time = max(1, rate_limit_info["reset"] - int(time.time()))
-                logging.warning(f"Rate limit exceeded. Retrying in {retry_delay} seconds (attempt {attempt+1}/{max_retries}).")
-                time.sleep(retry_delay)
-                retry_delay *= 2
-                if attempt == max_retries - 1:
-                    logging.error("Max retries reached. Setting sentiment score to 0.")
-                    data_manager.sentiment_score = 0.0
-
-            except Exception as e:
-                logging.error(f"Error fetching sentiment data: {e}")
-                data_manager.sentiment_score = 0.0
-                break
-
-    except Exception as e:
-        logging.error(f"Error in fetch_sentiment_data: {e}")
-        data_manager.sentiment_score = 0.0
 
 # Tự triển khai RVI
 def calculate_rvi(df, window=14):
@@ -563,7 +460,6 @@ def predict_with_finbert(df, data_manager, model, tokenizer, device, batch_size=
         
         trend_1h = data_manager.df_1h['ema_5'].iloc[-1] > data_manager.df_1h['ema_10'].iloc[-1] if not data_manager.df_1h.empty else True
         trend_4h = data_manager.df_4h['ema_5'].iloc[-1] > data_manager.df_4h['ema_10'].iloc[-1] if not data_manager.df_4h.empty else True
-        sentiment_condition = data_manager.sentiment_score > 0.1
         
         df.loc[(df['prob_positive'] > prob_threshold) & 
                (df['ema_5'] > df['ema_10']) & 
@@ -573,8 +469,7 @@ def predict_with_finbert(df, data_manager, model, tokenizer, device, batch_size=
                (df['adx'] > adx_threshold) & 
                (df['roc'] > 0) & 
                (trend_1h) & 
-               (trend_4h) & 
-               (sentiment_condition), 'signal'] = 'LONG'
+               (trend_4h), 'signal'] = 'LONG'
         
         df.loc[(df['prob_negative'] > prob_threshold) & 
                (df['ema_5'] < df['ema_10']) & 
@@ -584,8 +479,7 @@ def predict_with_finbert(df, data_manager, model, tokenizer, device, batch_size=
                (df['adx'] > adx_threshold) & 
                (df['roc'] < 0) & 
                (~trend_1h) & 
-               (~trend_4h) & 
-               (~sentiment_condition), 'signal'] = 'SHORT'
+               (~trend_4h), 'signal'] = 'SHORT'
     except Exception as e:
         logging.error(f"Error generating signals: {e}")
         df['signal'] = None
@@ -648,8 +542,6 @@ def optimize_feature_weights(data_manager):
 
 # Hàm chính để xử lý và dự đoán xu hướng
 def process_and_predict(exchange, symbol, data_manager, model, tokenizer, device, script_start_time):
-    global last_fetched_hour
-    
     update_interval = 30
     ohlcv_update_interval = 300
     retrain_interval = 86400
@@ -699,11 +591,6 @@ def process_and_predict(exchange, symbol, data_manager, model, tokenizer, device
                 last_ohlcv_update = time.time()
             except Exception as e:
                 logging.error(f"Error updating OHLCV data: {e}")
-
-        if should_fetch_sentiment_data():
-            fetch_sentiment_data(data_manager, model, tokenizer, device)
-            last_fetched_hour = datetime.utcnow().hour
-            logging.info(f"Fetched sentiment data at hour {last_fetched_hour} UTC")
 
         if time.time() - last_feature_weight_update >= feature_weight_update_interval:
             data_manager.feature_weights = optimize_feature_weights(data_manager)
