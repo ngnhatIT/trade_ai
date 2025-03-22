@@ -36,16 +36,16 @@ logging.basicConfig(
 )
 
 # X API rate limit constants
-MONTHLY_TWEET_LIMIT = 10000  # Free tier limit for X API
-RATE_LIMIT_THRESHOLD = 10  # Pause when remaining calls are below this threshold
-TWEET_READ_LOG_FILE = "tweet_read_log.csv"  # File to log tweet read counts
-TWEET_READ_COUNT = 0  # Counter for tweets read
+MONTHLY_TWEET_LIMIT = 10000
+RATE_LIMIT_THRESHOLD = 10
+TWEET_READ_LOG_FILE = "tweet_read_log.csv"
+TWEET_READ_COUNT = 0
 rate_limit_info = {
-    "limit": 900,  # Default rate limit for search_recent_tweets (900 requests per 15 minutes)
+    "limit": 900,
     "remaining": 900,
-    "reset": int(time.time()) + 900  # Reset time in seconds (15 minutes)
+    "reset": int(time.time()) + 900
 }
-last_fetched_hour = -1  # Track the last hour when sentiment data was fetched
+last_fetched_hour = -1
 
 # Initialize X API client
 try:
@@ -75,11 +75,24 @@ def send_telegram_message(message):
     except Exception as e:
         logging.error(f"Lỗi khi gửi Telegram: {e}")
 
+# Hàm kiểm tra tài nguyên hệ thống
+def check_system_resources():
+    process = psutil.Process(os.getpid())
+    mem_info = process.memory_info()
+    mem_usage_mb = mem_info.rss / 1024 / 1024
+    total_mem_mb = psutil.virtual_memory().total / 1024 / 1024
+    mem_percent = (mem_usage_mb / total_mem_mb) * 100
+    cpu_percent = psutil.cpu_percent(interval=1)
+    logging.info(f"System Resources - Memory: {mem_usage_mb:.2f}/{total_mem_mb:.2f} MB ({mem_percent:.2f}%), CPU: {cpu_percent:.2f}%")
+    if mem_percent > 90:
+        logging.warning("High memory usage detected! Consider reducing batch size or using a smaller model.")
+    if cpu_percent > 90:
+        logging.warning("High CPU usage detected! Performance may be impacted.")
+
 # Hàm kiểm tra xem có nên lấy dữ liệu tâm lý không
 def should_fetch_sentiment_data():
     current_hour = datetime.utcnow().hour
-    # Fetch sentiment data every hour or during specific "sensitive" hours (e.g., 8 AM, 12 PM, 4 PM UTC)
-    sensitive_hours = [8, 12, 16]  # Example sensitive hours
+    sensitive_hours = [8, 12, 16]
     return current_hour != last_fetched_hour and (current_hour in sensitive_hours or True)
 
 # Class quản lý dữ liệu
@@ -143,8 +156,8 @@ class DataManager:
             X.append(data[i-self.lookback:i])
             y.append(data[i, 0])
 
-        self.X_buffer = X[-1000:]  # Giới hạn 1000 phần tử
-        self.y_buffer = y[-1000:]  # Giới hạn 1000 phần tử
+        self.X_buffer = X[-1000:]
+        self.y_buffer = y[-1000:]
 
     def log_prediction(self, prediction, actual_price):
         self.predictions_log.append({
@@ -173,7 +186,7 @@ class DataManager:
 # Hàm tính metrics đánh giá
 def calculate_metrics(df):
     returns = df['close'].pct_change().dropna()
-    sharpe_ratio = (returns.mean() / returns.std()) * np.sqrt(252 * 24 * 12)  # Annualized (5m candles)
+    sharpe_ratio = (returns.mean() / returns.std()) * np.sqrt(252 * 24 * 12)
     signals = df[df['signal'].notnull()]
     if len(signals) > 0:
         win_rate = len(signals[(signals['signal'] == 'LONG') & (signals['close'].shift(-1) > signals['close'])]) / len(signals[signals['signal'] == 'LONG'])
@@ -234,13 +247,13 @@ def optimize_signal_thresholds(df, param_grid):
         df_with_signals = df.copy()
         df_with_signals['signal'] = signals['signal']
         final_balance = backtest_strategy(df_with_signals)
-        accuracy = final_balance / 10000  # Đơn giản hóa: dùng lợi nhuận làm thước đo
+        accuracy = final_balance / 10000
         if accuracy > best_accuracy:
             best_accuracy = accuracy
             best_params = params
     return best_params
 
-# Hàm lấy dữ liệu từ Binance API (REST) bằng ccxt
+# Hàm lấy dữ liệu từ Binance API
 def fetch_ohlcv_data(exchange, symbol, timeframe, hours_back, data_manager, limit=288):
     cache_file = f"{symbol.replace('/', '_')}_{timeframe}_cache.csv"
     if os.path.exists(cache_file):
@@ -307,7 +320,7 @@ def fetch_sentiment_data(data_manager, model, tokenizer, device):
             try:
                 response = client.search_recent_tweets(
                     query=query,
-                    max_results=500,  # Tăng số lượng tweet
+                    max_results=100,
                     tweet_fields=["created_at", "lang", "public_metrics"],
                     user_fields=["public_metrics"]
                 )
@@ -335,7 +348,7 @@ def fetch_sentiment_data(data_manager, model, tokenizer, device):
                 with torch.no_grad():
                     outputs = model(**inputs)
                     probs = torch.softmax(outputs.logits, dim=-1).cpu().numpy()
-                sentiment_score = np.mean(probs[:, 2] - probs[:, 0])  # Positive - Negative
+                sentiment_score = np.mean(probs[:, 2] - probs[:, 0])
                 data_manager.sentiment_score = sentiment_score
                 logging.info(f"Updated sentiment score: {sentiment_score:.4f} (based on {num_tweets} tweets)")
                 break
@@ -438,22 +451,37 @@ def preprocess_data(df, data_manager, current_price=None):
         "ROC " + df['roc'].astype(str)
     )
     
+    # Đảm bảo các cột xác suất tồn tại ngay từ đầu
+    for col in ['prob_positive', 'prob_negative', 'prob_neutral']:
+        if col not in df.columns:
+            df[col] = 0.0
+    
     return df.ffill().fillna(0)
 
 # Dự đoán với FinBERT và tính TP/SL
-def predict_with_finbert(df, data_manager, model, tokenizer, device, batch_size=8):
+def predict_with_finbert(df, data_manager, model, tokenizer, device, batch_size=2, max_rows_to_predict=50):
     if df.empty:
         logging.warning("DataFrame is empty in predict_with_finbert, returning unchanged")
         return df
 
-    # Ensure probability columns exist
+    # Đảm bảo các cột xác suất tồn tại và khởi tạo với giá trị 0
     for col in ['prob_positive', 'prob_negative', 'prob_neutral']:
         if col not in df.columns:
-            df[col] = np.nan
-            logging.info(f"Initialized {col} column with NaN")
+            df[col] = 0.0
+            logging.info(f"Initialized {col} column with 0")
+        else:
+            df[col] = df[col].fillna(0)
 
-    # Identify rows that need prediction
-    to_predict = df[df['prob_positive'].isna()]
+    # Kiểm tra trước khi dự đoán
+    if df['text'].isnull().any():
+        logging.warning("Some text entries are null, filling with empty string")
+        df['text'] = df['text'].fillna("")
+
+    # Chỉ dự đoán cho các hàng chưa có xác suất (prob_positive == 0)
+    to_predict = df[df['prob_positive'] == 0]
+    if len(to_predict) > max_rows_to_predict:
+        logging.info(f"Too many rows to predict ({len(to_predict)}), limiting to {max_rows_to_predict}")
+        to_predict = to_predict.tail(max_rows_to_predict)
     logging.info(f"Rows to predict: {len(to_predict)} out of {len(df)}")
 
     if to_predict.empty:
@@ -464,6 +492,7 @@ def predict_with_finbert(df, data_manager, model, tokenizer, device, batch_size=
             logging.info(f"No new data to predict with FinBERT, Total no-data counts: {predict_with_finbert.no_data_count}")
     else:
         try:
+            check_system_resources()  # Kiểm tra tài nguyên trước khi dự đoán
             texts = to_predict['text'].tolist()
             if not texts:
                 logging.warning("No text data available for FinBERT prediction")
@@ -472,24 +501,36 @@ def predict_with_finbert(df, data_manager, model, tokenizer, device, batch_size=
                 df['prob_neutral'] = df['prob_neutral'].fillna(0)
             else:
                 all_probs = []
+                total_batches = (len(texts) + batch_size - 1) // batch_size
                 for i in range(0, len(texts), batch_size):
                     batch_texts = texts[i:i + batch_size]
-                    inputs = tokenizer(batch_texts, return_tensors="pt", truncation=True, padding=True, max_length=512).to(device)
-                    with torch.no_grad():
-                        outputs = model(**inputs)
-                        probs = torch.softmax(outputs.logits, dim=-1)
-                        all_probs.append(probs.cpu().numpy())
-                    # Giải phóng bộ nhớ
-                    del inputs, outputs, probs
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
-                    gc.collect()
+                    batch_num = i // batch_size + 1
+                    logging.info(f"Processing batch {batch_num}/{total_batches} ({len(batch_texts)} texts)")
+                    try:
+                        inputs = tokenizer(batch_texts, return_tensors="pt", truncation=True, padding=True, max_length=512).to(device)
+                        with torch.no_grad():
+                            outputs = model(**inputs)
+                            probs = torch.softmax(outputs.logits, dim=-1)
+                            all_probs.append(probs.cpu().numpy())
+                        del inputs, outputs, probs
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                        gc.collect()
+                    except Exception as e:
+                        logging.error(f"Error in FinBERT prediction batch {batch_num}: {e}")
+                        # Fallback: Điền giá trị mặc định cho batch này
+                        batch_indices = to_predict.index[i:i + batch_size]
+                        df.loc[batch_indices, 'prob_positive'] = 0
+                        df.loc[batch_indices, 'prob_negative'] = 0
+                        df.loc[batch_indices, 'prob_neutral'] = 0
+                        continue
                 
                 if all_probs:
                     probs = np.concatenate(all_probs, axis=0)
-                    df.loc[df['prob_positive'].isna(), 'prob_negative'] = probs[:, 0]
-                    df.loc[df['prob_positive'].isna(), 'prob_neutral'] = probs[:, 1]
-                    df.loc[df['prob_positive'].isna(), 'prob_positive'] = probs[:, 2]
+                    predicted_indices = to_predict.index[:len(probs)]
+                    df.loc[predicted_indices, 'prob_negative'] = probs[:, 0]
+                    df.loc[predicted_indices, 'prob_neutral'] = probs[:, 1]
+                    df.loc[predicted_indices, 'prob_positive'] = probs[:, 2]
                     logging.info(f"Predicted probabilities for {len(probs)} new candles")
                 else:
                     logging.warning("No probabilities predicted by FinBERT, filling with 0")
@@ -502,13 +543,17 @@ def predict_with_finbert(df, data_manager, model, tokenizer, device, batch_size=
             df['prob_negative'] = df['prob_negative'].fillna(0)
             df['prob_neutral'] = df['prob_neutral'].fillna(0)
 
-    # Ensure no NaN values in probability columns before signal generation
-    df['prob_positive'] = df['prob_positive'].fillna(0)
-    df['prob_negative'] = df['prob_negative'].fillna(0)
-    df['prob_neutral'] = df['prob_neutral'].fillna(0)
+    # Kiểm tra lại cột prob_positive
+    if df['prob_positive'].isnull().any():
+        logging.warning("Found NaN values in prob_positive after prediction, filling with 0")
+        df['prob_positive'] = df['prob_positive'].fillna(0)
+    if df['prob_negative'].isnull().any():
+        df['prob_negative'] = df['prob_negative'].fillna(0)
+    if df['prob_neutral'].isnull().any():
+        df['prob_neutral'] = df['prob_neutral'].fillna(0)
     logging.info(f"prob_positive stats: min={df['prob_positive'].min()}, max={df['prob_positive'].max()}, mean={df['prob_positive'].mean()}")
 
-    # Initialize signal column
+    # Khởi tạo cột tín hiệu
     df['signal'] = None
     try:
         prob_threshold = data_manager.signal_thresholds['prob_threshold']
@@ -516,15 +561,11 @@ def predict_with_finbert(df, data_manager, model, tokenizer, device, batch_size=
         rsi_upper = data_manager.signal_thresholds['rsi_upper']
         adx_threshold = data_manager.signal_thresholds['adx_threshold']
         
-        # Kết hợp nhiều khung thời gian
         trend_1h = data_manager.df_1h['ema_5'].iloc[-1] > data_manager.df_1h['ema_10'].iloc[-1] if not data_manager.df_1h.empty else True
         trend_4h = data_manager.df_4h['ema_5'].iloc[-1] > data_manager.df_4h['ema_10'].iloc[-1] if not data_manager.df_4h.empty else True
-        
-        # Tích hợp tâm lý thị trường
         sentiment_condition = data_manager.sentiment_score > 0.1
         
-        # Generate signals with NaN handling
-        df.loc[(df['prob_positive'].fillna(0) > prob_threshold) & 
+        df.loc[(df['prob_positive'] > prob_threshold) & 
                (df['ema_5'] > df['ema_10']) & 
                (df['macd_diff'] > 0) & 
                (df['rsi'] > rsi_lower) & (df['rsi'] < rsi_upper) & 
@@ -535,7 +576,7 @@ def predict_with_finbert(df, data_manager, model, tokenizer, device, batch_size=
                (trend_4h) & 
                (sentiment_condition), 'signal'] = 'LONG'
         
-        df.loc[(df['prob_negative'].fillna(0) > prob_threshold) & 
+        df.loc[(df['prob_negative'] > prob_threshold) & 
                (df['ema_5'] < df['ema_10']) & 
                (df['macd_diff'] < 0) & 
                (df['rsi'] > rsi_lower) & (df['rsi'] < rsi_upper) & 
@@ -556,7 +597,6 @@ def predict_with_finbert(df, data_manager, model, tokenizer, device, batch_size=
         latest_atr = df['atr'].iloc[-1] if 'atr' in df.columns else 0
         current_price = data_manager.current_price
         if current_price is None:
-            # Fallback to last close price if current_price is None
             current_price = df['close'].iloc[-1] if not df.empty and 'close' in df.columns else 0
             logging.warning(f"Current price is None, using last close price: {current_price}")
 
@@ -614,8 +654,8 @@ def process_and_predict(exchange, symbol, data_manager, model, tokenizer, device
     ohlcv_update_interval = 300
     retrain_interval = 86400
     feature_weight_update_interval = 3600
-    prediction_interval = 300  # Dự đoán mỗi 5 phút
-    threshold_update_interval = 86400  # Cập nhật ngưỡng mỗi ngày
+    prediction_interval = 300
+    threshold_update_interval = 86400
     
     last_ohlcv_update = 0
     last_retrain = 0
@@ -627,14 +667,12 @@ def process_and_predict(exchange, symbol, data_manager, model, tokenizer, device
     while True:
         start_time = time.time()
         
-        # Lấy giá real-time trước khi xử lý dữ liệu
         try:
             ticker = exchange.fetch_ticker(symbol)
             current_price = ticker['last']
             data_manager.update_current_price(current_price)
         except Exception as e:
             logging.error(f"Error fetching ticker: {e}")
-            # Fallback to last close price if available
             if not data_manager.df_5m.empty and 'close' in data_manager.df_5m.columns:
                 data_manager.update_current_price(data_manager.df_5m['close'].iloc[-1])
                 logging.warning(f"Using last close price as fallback: {data_manager.current_price}")
@@ -642,7 +680,6 @@ def process_and_predict(exchange, symbol, data_manager, model, tokenizer, device
                 time.sleep(update_interval)
                 continue
         
-        # Cập nhật dữ liệu OHLCV
         data_updated = False
         if time.time() - last_ohlcv_update >= ohlcv_update_interval:
             try:
@@ -663,18 +700,15 @@ def process_and_predict(exchange, symbol, data_manager, model, tokenizer, device
             except Exception as e:
                 logging.error(f"Error updating OHLCV data: {e}")
 
-        # Cập nhật tâm lý thị trường
         if should_fetch_sentiment_data():
             fetch_sentiment_data(data_manager, model, tokenizer, device)
             last_fetched_hour = datetime.utcnow().hour
             logging.info(f"Fetched sentiment data at hour {last_fetched_hour} UTC")
 
-        # Cập nhật trọng số
         if time.time() - last_feature_weight_update >= feature_weight_update_interval:
             data_manager.feature_weights = optimize_feature_weights(data_manager)
             last_feature_weight_update = time.time()
 
-        # Cập nhật ngưỡng tín hiệu
         if time.time() - last_threshold_update >= threshold_update_interval:
             param_grid = {
                 'prob_threshold': [0.3, 0.4, 0.5],
@@ -688,7 +722,6 @@ def process_and_predict(exchange, symbol, data_manager, model, tokenizer, device
                 logging.info(f"Updated signal thresholds: {best_params}")
             last_threshold_update = time.time()
 
-        # Retrain định kỳ
         if time.time() - last_retrain >= retrain_interval:
             last_retrain = time.time()
 
@@ -697,27 +730,26 @@ def process_and_predict(exchange, symbol, data_manager, model, tokenizer, device
             time.sleep(update_interval)
             continue
         
-        # Tiền xử lý và dự đoán chỉ khi có dữ liệu mới
         if data_updated or (time.time() - last_prediction_time >= prediction_interval):
             try:
                 df_5m_processed = preprocess_data(data_manager.df_5m, data_manager, current_price=data_manager.current_price)
                 df_1h_processed = preprocess_data(data_manager.df_1h, data_manager) if not data_manager.df_1h.empty else pd.DataFrame()
                 df_4h_processed = preprocess_data(data_manager.df_4h, data_manager) if not data_manager.df_4h.empty else pd.DataFrame()
                 
-                df_5m_processed = predict_with_finbert(df_5m_processed, data_manager, model, tokenizer, device, batch_size=8)
+                df_5m_processed = predict_with_finbert(df_5m_processed, data_manager, model, tokenizer, device, batch_size=2)
                 
                 if df_5m_processed.empty or 'timestamp' not in df_5m_processed.columns:
                     logging.warning("Processed DataFrame 5m is empty or missing 'timestamp' column")
                     time.sleep(update_interval)
                     continue
                 
+                data_manager.df_5m = df_5m_processed  # Cập nhật DataFrame chính
                 last_prediction_time = time.time()
             except Exception as e:
                 logging.error(f"Error preprocessing data: {e}")
                 time.sleep(update_interval)
                 continue
         
-        # Hiển thị tín hiệu và TP/SL khi tín hiệu thay đổi
         latest_signal = df_5m_processed['signal'].iloc[-1] if not df_5m_processed.empty and 'signal' in df_5m_processed.columns else "N/A"
         latest_tp = df_5m_processed['tp'].iloc[-1] if not df_5m_processed.empty and 'tp' in df_5m_processed.columns else None
         latest_sl = df_5m_processed['sl'].iloc[-1] if not df_5m_processed.empty and 'sl' in df_5m_processed.columns else None
@@ -756,7 +788,6 @@ def process_and_predict(exchange, symbol, data_manager, model, tokenizer, device
         if len(data_manager.predictions_log) > 0:
             data_manager.evaluate_predictions()
 
-        # Đánh giá chiến lược định kỳ
         if time.time() - last_retrain >= retrain_interval:
             final_balance = backtest_strategy(data_manager.df_5m)
             logging.info(f"Backtest result: Final balance = {final_balance:.2f}")
@@ -767,25 +798,19 @@ def process_and_predict(exchange, symbol, data_manager, model, tokenizer, device
         time.sleep(sleep_time)
 
 if __name__ == "__main__":
-    symbol = 'BTC/USDT'
-    script_start_time = pd.to_datetime(datetime.now())
-    
-    data_manager = DataManager()
-    
     try:
-        exchange = ccxt.binance({
-            'enableRateLimit': True,
-        })
-    except Exception as e:
-        logging.error(f"Error initializing Binance exchange: {e}")
-        exit(1)
-    
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    logging.info(f"Using device: {device}")
-    
-    model_dir = Path("finbert_model")
-    model_dir.mkdir(exist_ok=True)
-    try:
+        symbol = 'BTC/USDT'
+        script_start_time = pd.to_datetime(datetime.now())
+        
+        data_manager = DataManager()
+        
+        exchange = ccxt.binance({'enableRateLimit': True})
+        
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        logging.info(f"Using device: {device}")
+        
+        model_dir = Path("finbert_model")
+        model_dir.mkdir(exist_ok=True)
         if (model_dir / "pytorch_model.bin").exists():
             logging.info("Loading FinBERT model from local directory")
             tokenizer = AutoTokenizer.from_pretrained(model_dir)
@@ -799,59 +824,34 @@ if __name__ == "__main__":
             logging.info(f"FinBERT model saved to {model_dir}")
         model.to(device)
         model.eval()
-    except Exception as e:
-        logging.error(f"Error loading FinBERT model: {e}")
-        exit(1)
-    
-    try:
-        data_manager.df_5m = fetch_ohlcv_data(exchange, symbol, '5m', hours_back=24, data_manager=data_manager, limit=288)
+        
+        # Giảm số lượng dữ liệu ban đầu để kiểm tra
+        data_manager.df_5m = fetch_ohlcv_data(exchange, symbol, '5m', hours_back=24, data_manager=data_manager, limit=50)  # Giảm từ 288 xuống 50
         data_manager.df_1h = fetch_ohlcv_data(exchange, symbol, '1h', hours_back=24*7, data_manager=data_manager, limit=168)
         data_manager.df_4h = fetch_ohlcv_data(exchange, symbol, '4h', hours_back=24*30, data_manager=data_manager, limit=180)
         
         if data_manager.df_5m.empty:
             logging.error("Failed to load initial 5m data. Exiting.")
             exit(1)
-    except Exception as e:
-        logging.error(f"Error fetching initial data: {e}")
-        exit(1)
-    
-    # Fetch initial current price before preprocessing
-    try:
+        
         ticker = exchange.fetch_ticker(symbol)
         current_price = ticker['last']
         data_manager.update_current_price(current_price)
-    except Exception as e:
-        logging.error(f"Error fetching initial ticker: {e}")
-        # Fallback to last close price if available
-        if not data_manager.df_5m.empty and 'close' in data_manager.df_5m.columns:
-            data_manager.update_current_price(data_manager.df_5m['close'].iloc[-1])
-            logging.warning(f"Using last close price as initial current price: {data_manager.current_price}")
-        else:
-            logging.error("No fallback price available. Exiting.")
-            exit(1)
-    
-    try:
+        
         data_manager.df_5m = preprocess_data(data_manager.df_5m, data_manager)
         data_manager.df_1h = preprocess_data(data_manager.df_1h, data_manager) if not data_manager.df_1h.empty else pd.DataFrame()
         data_manager.df_4h = preprocess_data(data_manager.df_4h, data_manager) if not data_manager.df_4h.empty else pd.DataFrame()
         
-        data_manager.df_5m = predict_with_finbert(data_manager.df_5m, data_manager, model, tokenizer, device, batch_size=8)
-    except Exception as e:
-        logging.error(f"Error preprocessing initial data: {e}")
-        exit(1)
-    
-    try:
+        data_manager.df_5m = predict_with_finbert(data_manager.df_5m, data_manager, model, tokenizer, device, batch_size=2)
+        
         initial_long_signals = data_manager.df_5m[data_manager.df_5m['signal'] == 'LONG'].copy()
         initial_short_signals = data_manager.df_5m[data_manager.df_5m['signal'] == 'SHORT'].copy()
         for _, signal in initial_long_signals.iterrows():
             logging.info(f"Initial past LONG signal: Time: {signal['timestamp']}, Price: {signal['close']:.2f}")
         for _, signal in initial_short_signals.iterrows():
             logging.info(f"Initial past SHORT signal: Time: {signal['timestamp']}, Price: {signal['close']:.2f}")
-    except Exception as e:
-        logging.error(f"Error logging initial signals: {e}")
-    
-    try:
+        
         process_and_predict(exchange, symbol, data_manager, model, tokenizer, device, script_start_time)
     except Exception as e:
-        logging.error(f"Error in main process: {e}")
+        logging.error(f"Unexpected error in main execution: {e}")
         exit(1)
