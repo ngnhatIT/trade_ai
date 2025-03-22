@@ -442,44 +442,78 @@ def preprocess_data(df, data_manager, current_price=None):
 
 # Dự đoán với FinBERT và tính TP/SL
 def predict_with_finbert(df, data_manager, model, tokenizer, device, batch_size=8):
-    if 'prob_positive' not in df.columns:
-        df['prob_positive'] = np.nan
-        df['prob_negative'] = np.nan
-        df['prob_neutral'] = np.nan
-    
+    if df.empty:
+        logging.warning("DataFrame is empty in predict_with_finbert, returning unchanged")
+        return df
+
+    # Ensure probability columns exist
+    for col in ['prob_positive', 'prob_negative', 'prob_neutral']:
+        if col not in df.columns:
+            df[col] = np.nan
+            logging.info(f"Initialized {col} column with NaN")
+
+    # Identify rows that need prediction
     to_predict = df[df['prob_positive'].isna()]
+    logging.info(f"Rows to predict: {len(to_predict)} out of {len(df)}")
+
     if to_predict.empty:
         if not hasattr(predict_with_finbert, 'no_data_count'):
             predict_with_finbert.no_data_count = 0
         predict_with_finbert.no_data_count += 1
         if predict_with_finbert.no_data_count % 5 == 0:
             logging.info(f"No new data to predict with FinBERT, Total no-data counts: {predict_with_finbert.no_data_count}")
+        # If no new data to predict, fill NaN with 0 to avoid issues in signal generation
+        df['prob_positive'] = df['prob_positive'].fillna(0)
+        df['prob_negative'] = df['prob_negative'].fillna(0)
+        df['prob_neutral'] = df['prob_neutral'].fillna(0)
     else:
         try:
             texts = to_predict['text'].tolist()
-            all_probs = []
-            for i in range(0, len(texts), batch_size):
-                batch_texts = texts[i:i + batch_size]
-                inputs = tokenizer(batch_texts, return_tensors="pt", truncation=True, padding=True, max_length=512).to(device)
-                with torch.no_grad():
-                    outputs = model(**inputs)
-                    probs = torch.softmax(outputs.logits, dim=-1)
-                    all_probs.append(probs.cpu().numpy())
-                # Giải phóng bộ nhớ
-                del inputs, outputs, probs
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-                gc.collect()
-            
-            if all_probs:
-                probs = np.concatenate(all_probs, axis=0)
-                df.loc[df['prob_positive'].isna(), 'prob_negative'] = probs[:, 0]
-                df.loc[df['prob_positive'].isna(), 'prob_neutral'] = probs[:, 1]
-                df.loc[df['prob_positive'].isna(), 'prob_positive'] = probs[:, 2]
-                logging.info(f"Predicted probabilities for {len(probs)} new candles")
+            if not texts:
+                logging.warning("No text data available for FinBERT prediction")
+                df['prob_positive'] = df['prob_positive'].fillna(0)
+                df['prob_negative'] = df['prob_negative'].fillna(0)
+                df['prob_neutral'] = df['prob_neutral'].fillna(0)
+            else:
+                all_probs = []
+                for i in range(0, len(texts), batch_size):
+                    batch_texts = texts[i:i + batch_size]
+                    inputs = tokenizer(batch_texts, return_tensors="pt", truncation=True, padding=True, max_length=512).to(device)
+                    with torch.no_grad():
+                        outputs = model(**inputs)
+                        probs = torch.softmax(outputs.logits, dim=-1)
+                        all_probs.append(probs.cpu().numpy())
+                    # Giải phóng bộ nhớ
+                    del inputs, outputs, probs
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    gc.collect()
+                
+                if all_probs:
+                    probs = np.concatenate(all_probs, axis=0)
+                    df.loc[df['prob_positive'].isna(), 'prob_negative'] = probs[:, 0]
+                    df.loc[df['prob_positive'].isna(), 'prob_neutral'] = probs[:, 1]
+                    df.loc[df['prob_positive'].isna(), 'prob_positive'] = probs[:, 2]
+                    logging.info(f"Predicted probabilities for {len(probs)} new candles")
+                else:
+                    logging.warning("No probabilities predicted by FinBERT, filling with 0")
+                    df['prob_positive'] = df['prob_positive'].fillna(0)
+                    df['prob_negative'] = df['prob_negative'].fillna(0)
+                    df['prob_neutral'] = df['prob_neutral'].fillna(0)
         except Exception as e:
             logging.error(f"Error predicting with FinBERT: {e}")
-    
+            df['prob_positive'] = df['prob_positive'].fillna(0)
+            df['prob_negative'] = df['prob_negative'].fillna(0)
+            df['prob_neutral'] = df['prob_neutral'].fillna(0)
+
+    # Validate prob_positive before signal generation
+    if 'prob_positive' not in df.columns or df['prob_positive'].isna().all():
+        logging.error("prob_positive column is missing or all NaN after prediction, setting to 0")
+        df['prob_positive'] = 0
+        df['prob_negative'] = 0
+        df['prob_neutral'] = 0
+
+    # Initialize signal column
     df['signal'] = None
     try:
         prob_threshold = data_manager.signal_thresholds['prob_threshold']
@@ -494,6 +528,7 @@ def predict_with_finbert(df, data_manager, model, tokenizer, device, batch_size=
         # Tích hợp tâm lý thị trường
         sentiment_condition = data_manager.sentiment_score > 0.1
         
+        # Generate signals
         df.loc[(df['prob_positive'] > prob_threshold) & 
                (df['ema_5'] > df['ema_10']) & 
                (df['macd_diff'] > 0) & 
@@ -517,6 +552,7 @@ def predict_with_finbert(df, data_manager, model, tokenizer, device, batch_size=
                (~sentiment_condition), 'signal'] = 'SHORT'
     except Exception as e:
         logging.error(f"Error generating signals: {e}")
+        df['signal'] = None
 
     # Tính TP/SL dựa trên ATR
     df['tp'] = np.nan
