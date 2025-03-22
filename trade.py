@@ -184,7 +184,7 @@ def fetch_ohlcv_data(exchange, symbol, timeframe, hours_back, data_manager, limi
         return pd.DataFrame()
 
 # Lấy dữ liệu tâm lý thị trường từ X (tích hợp dữ liệu thực với kiểm soát rate limit)
-BEARER_TOKEN = "your_bearer_token_here"
+BEARER_TOKEN = "AAAAAAAAAAAAAAAAAAAAAOlk0AEAAAAAgo9o2yJTC8k80o%2FYuxSSjvCmO8s%3DCWONLfMWOYGpRDRbv01pBZxmPltuIoTneXhVYJ55yhFHN69wzU"
 RATE_LIMIT_THRESHOLD = 10  # Ngưỡng an toàn: chỉ gửi request nếu còn ít nhất 10 request
 MONTHLY_TWEET_LIMIT = 10000  # Giới hạn tweet đọc/tháng (gói Basic)
 TWEET_READ_COUNT = 0  # Biến toàn cục để theo dõi số tweet đã đọc trong tháng
@@ -202,7 +202,7 @@ rate_limit_info = {
 
 def fetch_sentiment_data(data_manager, model, tokenizer, device):
     global TWEET_READ_COUNT, rate_limit_info
-    
+    logging.info("Fetching sentiment data from Twitter...")
     try:
         # Kiểm tra số tweet đã đọc trong tháng
         if TWEET_READ_COUNT >= MONTHLY_TWEET_LIMIT:
